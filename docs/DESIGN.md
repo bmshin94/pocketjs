@@ -66,7 +66,7 @@ artifacts: `$JOB_TMP/map-*.json`).
   region and replay the complete DrawList under a root clip; framebuffer
   format/scale signatures and `Ui::raster_revision()` prevent stale reuse.
   Region limits and full-redraw thresholds remain backend policy.
-- **ESP32-P4 stays 16-bit**: `engine/backends/esp32p4-ppa/` consumes the same
+- **ESP32-P4 stays 16-bit**: `engine/backends/rgb565/` consumes the same
   DrawList into an opaque RGB565 target. It maps flat fills, A8 coverage
   blending, and compatible PSM 5650 texture transforms to the PPA, then
   preserves ordering with the core RGB565 rasterizer for unsupported ops.
@@ -231,7 +231,7 @@ children[], …}`) so reconciler *reads* never cross the FFI. Handles are `i32`
 
 | op | signature | notes |
 |---|---|---|
-| createNode | `(type:i32) → id` | 0=view 1=text 2=image |
+| createNode | `(type:i32) → id` | 0=view 1=text 2=image 3=compositor surface |
 | destroyNode | `(id)` | subtree; frees anim tracks; clears focus if inside **[R]** |
 | insertBefore | `(parent, child, anchorOr0)` | **DOM move semantics: if child is attached anywhere, unlink first** (core tree + taffy + JS mirror) **[R]**; append when anchor=0; silently no-ops past `MAX_TREE_DEPTH` (spec, 64) so recursive tree walks stay stack-bounded on PSP |
 | removeChild | `(parent, child)` | keeps node alive (Solid re-inserts); renderer sweep destroys it at frame end if still detached |
@@ -241,12 +241,14 @@ children[], …}`) so reconciler *reads* never cross the FFI. Handles are `i32`
 | replaceText | `(id, str)` | Solid universal calls this on text updates |
 | uploadTexture | `(buf, w, h, psm) → handle` | pow2 ≤512, copied + 16B-aligned |
 | setImage | `(id, texHandle)` | texHandle < 0 clears (handles are 0-based: 0 is the first upload); also clears any sprite binding |
+| setCompositorSurface | `(id, surfaceHandle, focused)` | binds a type-3 node to a Pocket System application surface; emits `SURFACE_QUAD` with full geometry, clipped geometry and focus at the node's exact painter position. Surface handles use a separate namespace from textures |
 | setSprite | `(id, atlas, frames, cols, step)` | binds an ANIMATED SPRITE ATLAS to an image node: the atlas texture holds a `cols`-wide grid of `frames` cells; the core auto-plays it, drawing cell `(frame−start)/step % frames` as a TEX_QUAD UV sub-rect — derived at draw time from the vblank counter, so zero per-frame JS and byte-exact goldens. `frames ≤ 0` clears **[R]** |
 | animate | `(id, propId, to:f64, durMs, easing, delayMs) → animId` | from = current |
 | cancelAnim | `(animId)` | |
 | setFocus | `(idOr0)` | applies `focus:` variant natively |
 | loadStyles / loadFontAtlas | `(buf …)` | **web/test hosts only** — on PSP, hosts/psp/src/pak.rs feeds core directly from include_bytes! **[R]** |
 | measureText | `(str, fontSlot) → width` | JS convenience; layout measures natively |
+| wrapText | `(str, fontSlot, maxW) → u32[]` | soft-wrap break columns for one line (ascending UTF-16 indices, empty = fits): greedy word wrap over the slot's measure provider; native-text hosts install the host text system's wrapper (gpui LineWrapper) and its positions win. Optional — apps fall back to the same greedy rules over measureText |
 | loadTileTexture | `(pakKey, tileIndex) → handle` | decode ONE tile of a TILESET pak entry (spec.ts) into a CLUT8 texture, host-side — on PSP straight from `.rodata`, zero JS-heap transit. Hosts without it: the runtime falls back to `__pak` + uploadTexture (framework/src/tiles.ts) |
 | freeTexture | `(handle)` | releases a texture slot. Texture handles are **generation-tagged** like node ids (spec `TEX_SLOT_BITS`): a stale handle resolves to nothing and draws nothing — tile churn cannot sample a stranger's texture |
 | uploadImgEntry | `(blob) → handle` | self-contained IMG entry upload (v2: PSM_T8 palette, PackBits-RLE + linear-filter flags parsed core-side) |
@@ -315,7 +317,7 @@ widths):
 - **box**: `w-N|full|[px]`, `h-N|full|[px]`, `min/max-w/h-N`, `p*/m*-N`,
   `absolute|relative`, `inset/top/right/bottom/left-N`, `hidden`,
   `overflow-hidden` (scissor), `z-N`
-- **visual**: `bg-{palette}`, `bg-gradient-to-t|b|l|r` + `from-{c}`/`to-{c}`
+- **visual**: `bg-{palette}`, `bg-gradient-to-t|b|l|r` + `from-{c}`/optional `via-{c}`/`to-{c}`
   (per-vertex gouraud for square boxes; alpha-covered RECT spans for rounded
   boxes), `rounded|-sm|-md|-lg|-xl` (axis-aligned boxes get deterministic
   subpixel edge coverage; **`rounded-full` only on nodes whose w/h are
@@ -395,5 +397,11 @@ pak (base64-in-JS is the known QuickJS boot killer).
 
 Kinetic scroll views, CLUT/swizzled textures, render-to-texture opacity groups
 (per-vertex alpha propagation instead — wrong on overlap, fine for demos),
-kerning, `hover:`, percentage sizes beyond `-full`, 3DS/Android hosts,
+kerning, `hover:`, percentage sizes beyond `-full`, Android hosts,
 `rounded-full` on runtime-sized nodes.
+
+The 3DS left this list with `hosts/3ds` — a QuickJS guest over a PICA200
+backend. **The CIA boots and renders on a New 3DS LL.** The `3ds-dev` profile
+in `tools/3ds-profile.ts` stays outside the production registry until its
+synthesized-cursor, sprite, streamed-texture and large-atlas paths have direct
+coverage.

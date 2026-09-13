@@ -14,9 +14,12 @@
 // string resolves under every framework; an object resolves only under the
 // frameworks it lists, and pass 1 walks exactly what resolves — so widening
 // a row changes class-string collection and therefore styles.bin bytes.
-// gesture/kinetics/osk/virtual-list are declared solid-only for exactly that
-// reason: their npm export exists, but vue-vapor/octane builds must not
-// silently walk (or resolve) their Solid-flavored implementations.
+// osk/virtual-list are declared solid-only for exactly that reason: their
+// npm export exists, but vue-vapor/octane builds must not silently walk (or
+// resolve) their Solid-flavored implementations. gesture/kinetics keep their
+// recognizer/scroller machinery in framework-neutral core modules and list a
+// per-framework shim for solid and vue-vapor (octane still does not resolve
+// them).
 
 import type { PocketFramework } from "../src/config.ts";
 
@@ -52,9 +55,19 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
     aliases: ALL,
   },
   animation: { file: "framework/src/animation.ts", aliases: TWINS },
+  classic: { file: { solid: "framework/src/classic.ts" } },
+  "offload/provider": { file: "tools/offload-provider.ts" },
+  "offload/capabilities": { file: "tools/offload-capabilities.ts" },
+  offload: { file: "framework/src/offload.ts", aliases: TWINS },
+  "resource-state": { file: "framework/src/resource-state.ts", aliases: TWINS },
+  "resource-cache": { file: "framework/src/resource-cache.ts", aliases: TWINS },
+  "resource-offload": { file: "framework/src/resource-offload.ts", aliases: TWINS },
+  "resource-view": { file: { solid: "framework/src/resource-view.ts" } },
+  resource: { file: { solid: "framework/src/resource.ts" } },
   audio: { file: "framework/src/audio-api.ts", aliases: TWINS },
   clock: { file: "framework/src/clock.ts", aliases: TWINS },
   config: { file: "framework/src/config.ts" },
+  db: { file: "framework/src/db-api.ts", aliases: TWINS },
   components: {
     file: {
       solid: "framework/src/components.ts",
@@ -64,8 +77,16 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
     aliases: ALL,
   },
   devtools: { file: "framework/src/devtools.ts" },
+  display: { file: "framework/src/display.ts", aliases: TWINS },
   effects: { file: "framework/src/effects.ts", aliases: TWINS },
-  gesture: { file: { solid: "framework/src/gesture.ts" } },
+  fs: { file: "framework/src/fs-api.ts", aliases: TWINS },
+  gesture: {
+    file: {
+      solid: "framework/src/gesture.ts",
+      "vue-vapor": "framework/src/gesture.vue-vapor.ts",
+    },
+    aliases: ["vue-vapor"],
+  },
   host: { file: "framework/src/host.ts" },
   lifecycle: {
     file: {
@@ -77,9 +98,17 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   },
   hot: { file: "framework/src/hot.ts" },
   input: { file: "framework/src/input-api.ts", aliases: TWINS },
-  kinetics: { file: { solid: "framework/src/kinetics.ts" } },
+  kinetics: {
+    file: {
+      solid: "framework/src/kinetics.ts",
+      "vue-vapor": "framework/src/kinetics.vue-vapor.ts",
+    },
+    aliases: ["vue-vapor"],
+  },
   launcher: { file: "framework/src/launcher.ts" },
   manifest: { file: "framework/src/manifest/index.ts" },
+  "idf-host": { file: "framework/src/manifest/idf-host.ts" },
+  net: { file: "framework/src/net-api.ts", aliases: TWINS },
   osk: { file: { solid: "framework/src/osk.tsx" } },
   package: { file: "contracts/spec/pocket-package.ts" },
   platform: { file: "framework/src/platform.ts" },

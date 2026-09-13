@@ -27,6 +27,7 @@ import {
   universalValue,
   type NodeMirror,
 } from "./renderer-octane.ts";
+import { getAuxiliarySurfaceRoots } from "./display.ts";
 
 export type { NodeMirror } from "./renderer-octane.ts";
 
@@ -141,9 +142,20 @@ export interface SpriteProps {
   key?: string | number;
 }
 
+export interface CompositorSurfaceProps {
+  class?: string;
+  className?: string;
+  style?: StyleObject;
+  package: string;
+  focused?: boolean;
+  debugName?: string;
+  nodeRef?: NodeRef;
+  key?: string | number;
+}
+
 type Component<P> = (props: P) => SolidJSX.Element;
 
-function primitive<P extends object>(tag: "view" | "text" | "image"): Component<P> {
+function primitive<P extends object>(tag: "view" | "text" | "image" | "surface"): Component<P> {
   const plan = universalPlan(OCTANE_RENDERER_ID, {
     kind: "host",
     type: tag,
@@ -161,6 +173,7 @@ export const View = primitive<ViewProps>("view");
 export const Text = primitive<TextProps>("text");
 export const Image = primitive<ImageProps>("image");
 export const Sprite = primitive<SpriteProps>("image");
+export const CompositorSurface = primitive<CompositorSurfaceProps>("surface");
 
 // ---------------------------------------------------------------------------
 // Composites
@@ -247,6 +260,20 @@ export interface PortalProps {
 
 export function Portal(props: PortalProps) {
   const target = useMemo(() => overlayPortalTarget(), []);
+  return <>{createPortal(props.children, target)}</>;
+}
+
+export interface AuxiliarySurfaceProps {
+  children?: VNodeChild;
+}
+
+export function AuxiliarySurface(props: AuxiliarySurfaceProps) {
+  const target = useMemo(() => getAuxiliarySurfaceRoots().app, []);
+  return <>{createPortal(props.children, target)}</>;
+}
+
+export function AuxiliaryPortal(props: AuxiliarySurfaceProps) {
+  const target = useMemo(() => getAuxiliarySurfaceRoots().overlay, []);
   return <>{createPortal(props.children, target)}</>;
 }
 

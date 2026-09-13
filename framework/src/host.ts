@@ -22,6 +22,11 @@ import {
 // legacy/test bundles valid until they opt into a ResolvedBuildPlan.
 declare const __POCKET_TARGET__: string;
 declare const __POCKET_HOST_ABI__: number;
+// Replaced by tools/build.ts in EVERY build (default 60, `--hz` declares
+// another). Read at call time, not module time, so tests can exercise the
+// non-60 paths through a globalThis stand-in — a bundler define replaces the
+// identifier with a literal either way.
+declare const __POCKET_TICK_HZ__: number;
 
 export interface BuildHostContract {
   readonly target: string;
@@ -32,7 +37,7 @@ export interface BuildHostContract {
  *  node id 0 means "none" (anchor 0 = append, setFocus 0 = clear). Texture
  *  handles have operation-specific 0-based or generation-tagged contracts. */
 export interface HostOps {
-  /** type: spec NODE_TYPE (0 view, 1 text, 2 image) → new node id. */
+  /** type: spec NODE_TYPE (0 view, 1 text, 2 image, 3 surface) → node id. */
   createNode(type: number): number;
   /** Destroys the whole subtree; frees anim tracks; clears focus if inside. */
   destroyNode(id: number): void;
@@ -59,6 +64,9 @@ export interface HostOps {
   uploadTexture(buf: Uint8Array, w: number, h: number, psm: number): number;
   /** texHandle < 0 clears the image (handles are 0-based: 0 is a real one). */
   setImage(id: number, texHandle: number): void;
+  /** Bind a native application surface to a surface node. Optional on
+   *  hosts without ui.compositor-surfaces; handle < 0 clears the binding. */
+  setCompositorSurface?(id: number, handle: number, focused: number): void;
   /**
    * Bind an animated sprite atlas to an image node: `atlas` is an uploaded
    * texture (a `cols`-wide grid of `frames` cells); the core auto-plays it,
@@ -98,6 +106,10 @@ export interface HostOps {
    *  their box — the touch hit fact resolver's query form. The gesture layer
    *  only calls it when the host delivers no per-contact fact (frame() arg 4). */
   hitTestBounds?(x: number, y: number): number;
+  /** Auxiliary-surface twins (spec ops 45–46). Present with
+   * display.auxiliary; coordinates belong to its logical viewport. */
+  hitTestAuxiliary?(x: number, y: number): number;
+  hitTestBoundsAuxiliary?(x: number, y: number): number;
   /** Bind the cursor sprite: an uploaded texture drawn topmost every frame,
    *  offset by its hotspot; never laid out, never hit-tested. tex < 0 hides
    *  it; w/h <= 0 draw at the texture's own pixel size. */
@@ -116,6 +128,14 @@ export interface HostOps {
   loadFontAtlas?(buf: Uint8Array): void;
   /** JS-side convenience; layout measures natively. → width in px. */
   measureText(str: string, fontSlot: number): number;
+  /** Soft-wrap break columns for ONE line under maxW px (spec op 43):
+   *  ascending UTF-16 code-unit indices, empty = the line fits. The engine
+   *  computes greedy word wrap over the same provider that measures and
+   *  paints the slot; native-text backends may install the host text
+   *  system's wrapper (gpui LineWrapper) whose positions win. Optional:
+   *  hosts that predate it — apps fall back to matching greedy rules over
+   *  measureText. */
+  wrapText?(str: string, fontSlot: number, maxW: number): number[];
 
   // -- streamed textures (spec ops 23..25) — deep-zoom tile canvases. Native
   //    hosts (PSP, uihost) implement loadTileTexture so tile bytes never
@@ -173,18 +193,18 @@ export interface HostOps {
   debugPause?(on: boolean | number): void;
   /** Arm exactly one tick while paused. */
   debugStep?(): void;
-  /** PSP mailbox transport (hosts/psp/src/dbg.rs); absent elsewhere. */
+  /** Native DevTools transport (PSP mailbox or paired 3DS TCP connection). */
   __dbgActive?(): boolean;
   __dbgPoll?(): string | undefined;
   __dbgSend?(line: string): void;
-  /** PSP on-demand screenshot: dump the displayed framebuffer to
-   *  pocketjs-dbg/shot.raw (bridge converts to PNG). → success. */
+  /** On-demand native screenshot. The host transports bulk pixels outside
+   *  the JSON control channel and its bridge converts them to PNG. */
+  __dbgShot?(): boolean;
   /** OP.debugStats — one JSON snapshot of device diagnostic counters
    *  (audio/vid/svc) plus build identity (app output name + FNV-1a64 of the
    *  embedded js+pak). Hosts without counters omit the op; the devtools
    *  "stats" message replies with data: null then. */
   debugStats?(): string;
-  __dbgShot?(): boolean;
 
   // -- app switching (spec ops 39..41, docs/LAUNCHER.md). Optional: only
   //    multi-app hosts (the launcher EBOOT, hosts/sim's launcher runner)
@@ -208,6 +228,17 @@ export interface HostOps {
   __host?: string;
   /** Version of the JS/native HostOps ABI implemented by this namespace. */
   __hostAbi?: number;
+  /** Ticks per second of virtual time the host drives this realm at. Absent
+   *  means the spec default 60 — hosts that predate per-realm rates only
+   *  ever ran 60. Bundles bake their rate (`--hz`) and refuse another. */
+  __tickHz?: number;
+  /** Pocket System package id -> compositor surface handle. Separate from the
+   *  texture namespace: compositor surfaces are not images. */
+  __surfaces?: Record<string, number>;
+  /** Host-created auxiliary UI root and target-owned logical viewport. This
+   * is separate from __surfaces, which names Pocket System app compositor
+   * handles rather than outputs of the current AppInstance. */
+  __auxiliarySurface?: { readonly root: number; readonly w: number; readonly h: number };
 }
 
 /** Desktop hosts publish their logical UI size as `ui.__viewport` (the core
@@ -239,11 +270,28 @@ export function embeddedBuildHostContract(): BuildHostContract | null {
   return target && hostAbi > 0 ? { target, hostAbi } : null;
 }
 
-/** Fail before mounting when a bundle was packaged with the wrong native host. */
+/** Fail before mounting when a bundle was packaged with the wrong native
+ *  host, or baked for a tick rate the host does not drive. The rate check
+ *  runs for every native mount — plan-less bundles bake a rate too. */
 export function assertNativeHostContract(
   ops: HostOps,
   expected: BuildHostContract | null = embeddedBuildHostContract(),
 ): void {
+  const baked =
+    typeof __POCKET_TICK_HZ__ === "number" && __POCKET_TICK_HZ__ > 0
+      ? __POCKET_TICK_HZ__
+      : 60;
+  const declared = ops.__tickHz ?? 60;
+  if (declared !== baked) {
+    throw new Error(
+      ops.__tickHz === undefined
+        ? `PocketJS: this bundle bakes ${baked} Hz virtual time but the host declares no ui.__tickHz, ` +
+          "which means the 60 Hz default — declare the rate before mount and drive the surface at it " +
+          "(pocket_apple set_tick_rate before eval_bundle; PocketSurfaceView.tickRate)"
+        : `PocketJS: tick-rate mismatch (bundle baked at ${baked} Hz, host drives ${declared} Hz) — ` +
+          "a bundle only runs correctly at the rate it was built with (`--hz`), like glyphs at their density",
+    );
+  }
   if (!expected) return;
   if (typeof ops.__host !== "string") {
     throw new Error(
@@ -357,7 +405,8 @@ export function reportAppAction(name: string, value: number): void {
 // Frame hookup
 // ---------------------------------------------------------------------------
 // Every host drives frames the same way: once per vblank/rAF tick it calls
-// `globalThis.frame(buttons, analog?, touches?)` with the PSP button bitmask (spec BTN)
+// `globalThis.frame(buttons, analog?, touches?, hits?, touchSurfaces?, rightAnalog?)` with the
+// PSP button bitmask (spec BTN)
 // and, when the host has an analog stick, the packed nub value
 // (x << 8 | y, each axis 0..255, 128 = center — spec ANALOG_CENTER). Hosts
 // without a stick pass one argument; the runtime defaults to center, so every
@@ -366,7 +415,14 @@ export function reportAppAction(name: string, value: number): void {
 // via installFrameHandler.
 
 export function installFrameHandler(
-  fn: (buttons: number, analog?: number, touches?: readonly number[]) => void,
+  fn: (
+    buttons: number,
+    analog?: number,
+    touches?: readonly number[],
+    hits?: readonly number[],
+    touchSurfaces?: readonly number[],
+    rightAnalog?: number,
+  ) => void,
 ): void {
   (
     globalThis as {
@@ -374,6 +430,9 @@ export function installFrameHandler(
         buttons: number,
         analog?: number,
         touches?: readonly number[],
+        hits?: readonly number[],
+        touchSurfaces?: readonly number[],
+        rightAnalog?: number,
       ) => void;
     }
   ).frame = fn;

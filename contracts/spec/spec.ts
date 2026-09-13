@@ -35,6 +35,8 @@ export const NODE_TYPE = {
   view: 0,
   text: 1,
   image: 2,
+  /** A native-compositor slot for an installed Pocket application. */
+  surface: 3,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +96,8 @@ export const SIZE_FULL = -1;
 //   loadStyles(buf) / loadFontAtlas(buf)   [web/test hosts only; PSP feeds core
 //                                           natively from the pak]
 //   measureText(str, fontSlot) -> width:f32
+//   setCompositorSurface(id, handle, focusedInt) [surface nodes only; handle
+//                                                  < 0 clears]
 
 export const OP = {
   createNode: 1,
@@ -241,6 +245,38 @@ export const OP = {
   //                      contract note on that argument). The guest only
   //                      issues this op when no fact channel exists (devtools
   //                      replay, injected test hosts, older wasm builds).
+  // -- text wrap (the platform half of soft-wrap layout; docs/BACKENDS.md) --
+  wrapText: 43, //        (str: string, fontSlot: i32, maxW: f32) -> u32[].
+  //                      Soft-wrap break columns for ONE line of text under
+  //                      maxW px, ascending UTF-16 code-unit indices (empty
+  //                      = the line fits). The engine computes
+  //                      greedy word wrap over the SAME provider that
+  //                      measures and paints the slot (atlas advances, or
+  //                      the native measurer for native-text apps): break
+  //                      BEFORE the word that overflows, space runs hang
+  //                      past maxW on the row they follow, a word wider than
+  //                      a whole row splits at character level. Native-text
+  //                      backends may install a host wrapper next to the
+  //                      measurer (Ui::set_text_wrap — gpui's LineWrapper)
+  //                      and its break positions win. Wrapped-coordinate
+  //                      bookkeeping (visual rows, caret/selection mapping)
+  //                      stays app-side — this op is the "where may it
+  //                      break" half only. Hosts without it: applications
+  //                      implement matching greedy rules over measureText.
+  setCompositorSurface: 44, // (id, surfaceHandle, focusedInt). Binds an
+  //                      Pocket System package surface to a NODE_TYPE.surface
+  //                      node. The core emits SURFACE_QUAD in ordinary paint
+  //                      order with BOTH full and clipped bounds; no image or
+  //                      texture semantics are involved. focusedInt is the
+  //                      shell's focus fact consumed by the native compositor
+  //                      for input and scheduling. handle < 0 clears.
+  // -- additional UI outputs (display.auxiliary capability) ----------------
+  hitTestAuxiliary: 45, // (x: f32, y: f32) -> topmost painted node id in the
+  //                      auxiliary output's logical coordinate space, or 0.
+  //                      Same semantics as hitTest; never searches primary.
+  hitTestBoundsAuxiliary: 46, // bounds-only twin for auxiliary touch facts.
+  //                      Same semantics as hitTestBounds; never searches
+  //                      primary. Hosts omit both ops without the capability.
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +354,8 @@ export const PROP = {
   bevelInnerLight: 79, // color u32 ABGR
   bevelInnerDark: 80, //  color u32 ABGR
   bevelWidth: 81, //      f32 px per ring (default 1)
+  gradVia: 82, //         color u32 ABGR (optional middle gradient stop)
+  gradViaPos: 83, //      f32 0..1; NAN = no middle stop
 
   // -- text (96..127) --------------------------------------------------------
   textColor: 96, //     color u32 ABGR
@@ -476,6 +514,7 @@ export const PROP_VALUE_KIND: Record<PropName, number> = {
   bevelOuterLight: VALUE_KIND.color, bevelOuterDark: VALUE_KIND.color,
   bevelInnerLight: VALUE_KIND.color, bevelInnerDark: VALUE_KIND.color,
   bevelWidth: VALUE_KIND.f32,
+  gradVia: VALUE_KIND.color, gradViaPos: VALUE_KIND.f32,
   textColor: VALUE_KIND.color, fontSlot: VALUE_KIND.int,
   textAlign: VALUE_KIND.int, lineHeight: VALUE_KIND.f32, tracking: VALUE_KIND.f32,
   translateX: VALUE_KIND.f32, translateY: VALUE_KIND.f32,
@@ -859,7 +898,9 @@ export const WIRE_MARK_FLAG_ENDED = 1 << 0;
 // regular + bold — see docs/DESIGN.md). Slot indices are assigned by the build and
 // carried in each atlas header; the core just indexes a table.
 
-export const MAX_FONT_SLOTS = 16;
+// 0..6 regular / 7..13 bold (FONT_PX sizes), 14/15 the 54 px display pair,
+// 16..18 monospace regular (12/14/16 px — `font-mono`, code spans).
+export const MAX_FONT_SLOTS = 24;
 
 // ---------------------------------------------------------------------------
 // STYLE TABLE binary format — styles.bin  (version 2)
@@ -1368,6 +1409,40 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                           perspective variation (projectively correct UVs
 //                           at every cell corner), so interior texture lines
 //                           do not kink at triangle diagonals.
+//   TEXT_RUN    (8 + ceil(n/4) words):
+//                           op,
+//                           word1: bits 0-7 fontSlot,
+//                                  bits 8-15 TextAlign ordinal,
+//                           originX, originY, boxW, lineHeight (f32 bits;
+//                           content-box top-left + width in logical px;
+//                           lineHeight NaN = the slot's default),
+//                           color,
+//                           byteLen (u32), then ceil(n/4) words of the run
+//                           string's UTF-8 bytes packed little-endian and
+//                           zero-padded. Emitted ONLY when the host installed
+//                           a native text measurer (docs/BACKENDS.md) and the
+//                           node's recorded provider is native; every other
+//                           run keeps GLYPH_RUN, so fixed-function backends
+//                           (PSP GE, PPA, software raster) never see this op.
+//                           The backend decodes and shapes the bytes with the
+//                           host text system. The words alone are the COMPLETE
+//                           pixel truth — no side table — so DrawList
+//                           snapshots, demand-render hashes and damage diffs
+//                           stay exact by construction. originX/Y are f32
+//                           (NOT the i16 XY packing) and are exempt from the
+//                           i16 clip guarantee: a run may start off-viewport,
+//                           and the core brackets any partially-clipped run
+//                           in SCISSOR/SCISSOR_POP.
+//   SURFACE_QUAD (9 words): op, surfaceHandle,
+//                           fullX, fullY, fullW, fullH (f32 bits; the shell
+//                           node's unclipped logical bounds), clipXY, clipWH
+//                           (the visible integer destination after every
+//                           enclosing clip), flags (bit 0 = focused).
+//                           This is a native compositor instruction. It owns
+//                           no pixels in software/fixed-function backends and
+//                           is emitted exactly where the surface node occurs
+//                           in shell painter order, so later shell ops remain
+//                           above the child surface.
 
 export const DRAW_OP = {
   rect: 1,
@@ -1378,6 +1453,8 @@ export const DRAW_OP = {
   scissorPop: 6,
   tri: 7,
   texTri: 8,
+  textRun: 9,
+  surfaceQuad: 10,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1488,15 @@ export const PAK_DTYPE = {
 // ---------------------------------------------------------------------------
 // Verified against dreamcart web/engine.js (BTN), framework/src/input.ts (Btn)
 // and rust-psp/psp/src/sys/ctrl.rs (CtrlButtons).
+//
+// ZL/ZR are the one addition to the PSP set: a machine can have more shoulder
+// buttons than a PSP did (a New 3DS has four), and an app that wants a HELD
+// modifier has nowhere else to put it — every other bit already means
+// something an app is using. They take two of the gap bits the PSP never
+// assigned, so the mask stays inside the 16-bit window real PSP hardware uses
+// (0x10000 is HOME and 0x20000 is HOLD there). A host without them simply
+// never sets the bits, and an app must treat them as an enhancement: no
+// input.buttons contract promises they exist.
 
 export const BTN = {
   SELECT: 0x0001,
@@ -1421,6 +1507,8 @@ export const BTN = {
   LEFT: 0x0080,
   LTRIGGER: 0x0100,
   RTRIGGER: 0x0200,
+  ZL: 0x0400,
+  ZR: 0x0800,
   TRIANGLE: 0x1000,
   CIRCLE: 0x2000,
   CROSS: 0x4000,
@@ -1437,11 +1525,15 @@ export const BTN = {
 // is unchanged. Deadzone/normalization is runtime policy (framework/src/frame.ts), not
 // host policy — hosts pass the raw value through.
 
+// Optional sixth frame argument carries the right stick with identical packing.
+// Omission reads as center; touch/hit/surface arguments retain their positions.
 export const ANALOG_CENTER = 0x8080;
 
 // ---------------------------------------------------------------------------
 // Fixed timestep
 // ---------------------------------------------------------------------------
-/** Core animation/tick timestep: exactly 1/60 s. Frame content is a pure
- *  function of frame index — this is what makes byte-exact goldens possible. */
+/** Core animation/tick timestep: exactly 1/60 s unless the realm declared
+ *  another rate before its first tick (Ui::set_tick_rate; still fixed for
+ *  the whole run — 1/hz s, hz at most 240). Frame content is a pure function
+ *  of frame index — this is what makes byte-exact goldens possible. */
 export const FIXED_DT = 1 / 60;

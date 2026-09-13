@@ -13,6 +13,7 @@
 import { ANALOG_CENTER } from "../../contracts/spec/spec.ts";
 import type { HostOps } from "./host.ts";
 import { rootMirror, setTreeMutationHook, type NodeMirror } from "./native-tree.ts";
+import { getAuxiliarySurfaceRoots, hasAuxiliarySurface } from "./display.ts";
 
 export interface DevtoolsTransport {
   /** Ship one JSON line to the panel(s). */
@@ -25,7 +26,7 @@ export interface DevtoolsTransport {
 
 /** Input tape: the complete session input, RLE-encoded (docs/DEVTOOLS.md §4). */
 export interface Tape {
-  v: 1 | 2;
+  v: 1 | 2 | 3;
   app?: string;
   /** Total frames represented by `masks`. */
   frames: number;
@@ -35,6 +36,8 @@ export interface Tape {
    *  frame count as `masks`. Omitted when the whole session held center —
    *  pre-analog tapes stay byte-identical and replay as center. */
   analog?: [number, number][];
+  /** Optional right-stick RLE track; omitted on hosts without a right stick. */
+  rightAnalog?: [number, number][];
   /** v2: sparse touch track — [frameIndex (relative to the tape start),
    *  packed contacts] entries for exactly the frames that HAD contacts
    *  (touch.ts __packTouch words). Contacts vary per frame during a drag, so
@@ -42,6 +45,9 @@ export interface Tape {
    *  touch-free session exports v:1 with no track — byte-identical to
    *  pre-touch tapes — and replays every frame as no-contacts. */
   touch?: [number, number[]][];
+  /** v3: sparse lane parallel to `touch`; 0 = primary, 1 = auxiliary.
+   * Omitted contacts belong to primary, preserving every v1/v2 tape. */
+  touchSurfaces?: [number, number[]][];
   /** Absolute frame index of masks[0] (0 unless the ring wrapped). */
   startFrame?: number;
 }
@@ -59,16 +65,20 @@ interface DevtoolsState {
   // tape ring (masks + packed analog + touch share indices/start/len)
   tape: Uint16Array;
   tapeAnalog: Uint16Array;
+  tapeRightAnalog: Uint16Array | null;
   /** Touch ring — allocated lazily on the first frame that HAS contacts, so
    *  touch-free sessions (every PSP session) never pay for it. */
   tapeTouch: (number[] | null)[] | null;
+  tapeTouchSurfaces: (number[] | null)[] | null;
   tapeStart: number; // ring index of the oldest frame
   tapeLen: number;
   tapeFirstFrame: number; // absolute frame index of the oldest entry
   // replay
   replayMasks: Uint16Array | null;
   replayAnalog: Uint16Array | null;
+  replayRightAnalog: Uint16Array | null;
   replayTouch: (number[] | undefined)[] | null;
+  replayTouchSurfaces: (number[] | undefined)[] | null;
   replayAt: number;
   // pause
   paused: boolean;
@@ -92,13 +102,17 @@ const state: DevtoolsState = {
   frame: 0,
   tape: new Uint16Array(TAPE_CAP),
   tapeAnalog: new Uint16Array(TAPE_CAP),
+  tapeRightAnalog: null,
   tapeTouch: null,
+  tapeTouchSurfaces: null,
   tapeStart: 0,
   tapeLen: 0,
   tapeFirstFrame: 0,
   replayMasks: null,
   replayAnalog: null,
+  replayRightAnalog: null,
   replayTouch: null,
+  replayTouchSurfaces: null,
   replayAt: 0,
   paused: false,
   stepQueued: 0,
@@ -132,9 +146,13 @@ export function initDevtools(ops: HostOps): void {
   state.tapeLen = 0;
   state.tapeFirstFrame = 0;
   state.tapeTouch = null;
+  state.tapeRightAnalog = null;
+  state.tapeTouchSurfaces = null;
   state.replayMasks = null;
   state.replayAnalog = null;
+  state.replayRightAnalog = null;
   state.replayTouch = null;
+  state.replayTouchSurfaces = null;
   state.paused = false;
   state.stepQueued = 0;
   state.inspectReportId = null;
@@ -174,13 +192,29 @@ export function initDevtools(ops: HostOps): void {
 
 /** Wrap the composed frame handler (render()'s input+hooks+sweep closure). */
 export function wrapFrameHandler(
-  h: (buttons: number, analog: number, touches?: readonly number[], hits?: readonly number[]) => void,
-): (buttons: number, analog?: number, touches?: readonly number[], hits?: readonly number[]) => void {
+  h: (
+    buttons: number,
+    analog: number,
+    touches?: readonly number[],
+    hits?: readonly number[],
+    touchSurfaces?: readonly number[],
+  rightAnalog?: number,
+  ) => void,
+): (
+  buttons: number,
+  analog?: number,
+  touches?: readonly number[],
+  hits?: readonly number[],
+  touchSurfaces?: readonly number[],
+  rightAnalog?: number,
+) => void {
   return (
     buttons: number,
     analogArg?: number,
     touchArg?: readonly number[],
     hitsArg?: readonly number[],
+    touchSurfacesArg?: readonly number[],
+    rightAnalogArg?: number,
   ) => {
     state.hostCalls++;
     if (state.transport) {
@@ -189,16 +223,22 @@ export function wrapFrameHandler(
     }
     let mask = buttons;
     let analog = analogArg === undefined ? ANALOG_CENTER : analogArg & 0xffff;
+    let rightAnalog = rightAnalogArg === undefined ? ANALOG_CENTER : rightAnalogArg & 0xffff;
     let touch = touchArg;
     let hits = hitsArg;
+    let touchSurfaces = touchSurfacesArg;
     if (state.replayMasks) {
       if (state.replayAt < state.replayMasks.length) {
         mask = state.replayMasks[state.replayAt];
         analog = state.replayAnalog ? state.replayAnalog[state.replayAt] : ANALOG_CENTER;
+        rightAnalog = state.replayRightAnalog ? state.replayRightAnalog[state.replayAt] : ANALOG_CENTER;
         // Replay owns EVERY input track: live hardware touch must not leak
         // into the deterministic tape. A v1 tape (no touch track) replays
         // every frame as no-contacts.
         touch = state.replayTouch ? state.replayTouch[state.replayAt] : undefined;
+        touchSurfaces = state.replayTouchSurfaces
+          ? state.replayTouchSurfaces[state.replayAt]
+          : undefined;
         // Hit facts are DERIVED, not recorded: the host resolved them for the
         // LIVE contacts, so they cannot describe the tape's. Dropping them
         // sends the gesture layer down its deterministic query fallback
@@ -209,7 +249,9 @@ export function wrapFrameHandler(
       } else {
         state.replayMasks = null; // tape exhausted: back to live input
         state.replayAnalog = null;
+        state.replayRightAnalog = null;
         state.replayTouch = null;
+        state.replayTouchSurfaces = null;
         send({ t: "replayDone", frame: state.frame });
       }
     }
@@ -218,10 +260,10 @@ export function wrapFrameHandler(
       state.stepQueued--;
       state.ops?.debugStep?.(); // arm exactly one core tick
     }
-    recordMask(mask, analog, touch);
+    recordMask(mask, analog, touch, touchSurfaces, rightAnalog);
     state.frame++;
     try {
-      h(mask, analog, touch, hits);
+      h(mask, analog, touch, hits, touchSurfaces, rightAnalog);
     } catch (e) {
       send({
         t: "error",
@@ -239,7 +281,15 @@ export function wrapFrameHandler(
 // tape
 // ---------------------------------------------------------------------------
 
-function recordMask(mask: number, analog: number, touch?: readonly number[]): void {
+function recordMask(
+  mask: number,
+  analog: number,
+  touch?: readonly number[],
+  touchSurfaces?: readonly number[],
+  rightAnalog?: number,
+): void {
+  const right = rightAnalog ?? ANALOG_CENTER;
+  if (right !== ANALOG_CENTER && !state.tapeRightAnalog) state.tapeRightAnalog = new Uint16Array(TAPE_CAP).fill(ANALOG_CENTER);
   // Defensive copy: hosts may reuse the packed-contact buffer across frames.
   const contacts = touch && touch.length > 0 ? touch.slice(0, 8) : null;
   if (contacts && !state.tapeTouch) {
@@ -247,16 +297,26 @@ function recordMask(mask: number, analog: number, touch?: readonly number[]): vo
     // never reach here). Frames recorded before this point had no contacts.
     state.tapeTouch = new Array<number[] | null>(TAPE_CAP).fill(null);
   }
+  const surfaces = contacts && touchSurfaces
+    ? touchSurfaces.slice(0, contacts.length).map((surface) => surface === 1 ? 1 : 0)
+    : null;
+  if (surfaces?.some((surface) => surface === 1) && !state.tapeTouchSurfaces) {
+    state.tapeTouchSurfaces = new Array<number[] | null>(TAPE_CAP).fill(null);
+  }
   if (state.tapeLen < TAPE_CAP) {
     const at = (state.tapeStart + state.tapeLen) % TAPE_CAP;
     state.tape[at] = mask;
     state.tapeAnalog[at] = analog;
+    if (state.tapeRightAnalog) state.tapeRightAnalog[at] = right;
     if (state.tapeTouch) state.tapeTouch[at] = contacts;
+    if (state.tapeTouchSurfaces) state.tapeTouchSurfaces[at] = surfaces;
     state.tapeLen++;
   } else {
     state.tape[state.tapeStart] = mask;
     state.tapeAnalog[state.tapeStart] = analog;
+    if (state.tapeRightAnalog) state.tapeRightAnalog[state.tapeStart] = right;
     if (state.tapeTouch) state.tapeTouch[state.tapeStart] = contacts;
+    if (state.tapeTouchSurfaces) state.tapeTouchSurfaces[state.tapeStart] = surfaces;
     state.tapeStart = (state.tapeStart + 1) % TAPE_CAP;
     state.tapeFirstFrame++;
   }
@@ -287,6 +347,10 @@ function exportTape(): Tape {
   if (analog.length > 1 || (analog.length === 1 && analog[0][0] !== ANALOG_CENTER)) {
     tape.analog = analog;
   }
+  if (state.tapeRightAnalog) {
+    const right = rlePairs(state.tapeRightAnalog);
+    if (right.some(([value]) => value !== ANALOG_CENTER)) tape.rightAnalog = right;
+  }
   // Touch upgrades the tape to v2 only when a recorded frame actually had
   // contacts — touch-free exports stay v:1 byte-identical.
   if (state.tapeTouch) {
@@ -298,6 +362,17 @@ function exportTape(): Tape {
     if (touch.length > 0) {
       tape.v = 2;
       tape.touch = touch;
+    }
+  }
+  if (state.tapeTouchSurfaces) {
+    const touchSurfaces: [number, number[]][] = [];
+    for (let i = 0; i < state.tapeLen; i++) {
+      const surfaces = state.tapeTouchSurfaces[(state.tapeStart + i) % TAPE_CAP];
+      if (surfaces) touchSurfaces.push([i, surfaces.slice()]);
+    }
+    if (touchSurfaces.length > 0) {
+      tape.v = 3;
+      tape.touchSurfaces = touchSurfaces;
     }
   }
   return tape;
@@ -328,6 +403,11 @@ export function expandTapeAnalog(tape: Tape): Uint16Array {
   return expandPairs(tape.analog ?? [], ANALOG_CENTER, total);
 }
 
+/** Expand the optional right-stick lane; legacy recordings are centered. */
+export function expandTapeRightAnalog(tape: Tape): Uint16Array {
+  return expandPairs(tape.rightAnalog ?? [], ANALOG_CENTER, tape.masks.reduce((n, [, count]) => n + count, 0));
+}
+
 /** Expand a tape's sparse touch track into one packed-contact array (or
  *  undefined) per frame. A v1 tape yields all-undefined — no contacts. */
 export function expandTapeTouch(tape: Tape): (number[] | undefined)[] {
@@ -336,6 +416,17 @@ export function expandTapeTouch(tape: Tape): (number[] | undefined)[] {
   const out = new Array<number[] | undefined>(total).fill(undefined);
   for (const [frame, contacts] of tape.touch ?? []) {
     if (frame >= 0 && frame < total) out[frame] = contacts;
+  }
+  return out;
+}
+
+/** Expand v3's sparse surface lane; v1/v2 contacts default to primary. */
+export function expandTapeTouchSurfaces(tape: Tape): (number[] | undefined)[] {
+  let total = 0;
+  for (const [, n] of tape.masks) total += n;
+  const out = new Array<number[] | undefined>(total).fill(undefined);
+  for (const [frame, surfaces] of tape.touchSurfaces ?? []) {
+    if (frame >= 0 && frame < total) out[frame] = surfaces;
   }
   return out;
 }
@@ -460,7 +551,11 @@ function handleMessage(line: string): void {
       if (tape && Array.isArray(tape.masks)) {
         state.replayMasks = expandTape(tape);
         state.replayAnalog = tape.analog ? expandTapeAnalog(tape) : null;
+        state.replayRightAnalog = tape.rightAnalog ? expandTapeRightAnalog(tape) : null;
         state.replayTouch = tape.touch ? expandTapeTouch(tape) : null;
+        state.replayTouchSurfaces = tape.touchSurfaces
+          ? expandTapeTouchSurfaces(tape)
+          : null;
         state.replayAt = 0;
       }
       break;
@@ -508,7 +603,7 @@ function sendStats(): void {
   send({
     t: "stats",
     frame: state.frame,
-    nodes: countNodes(rootMirror),
+    nodes: countMountedNodes(),
     tapeLen: state.tapeLen,
     paused: state.paused,
   });
@@ -517,7 +612,7 @@ function sendStats(): void {
 function sendTree(): void {
   state.treeDirty = false;
   state.treeSentAt = state.frame;
-  send({ t: "tree", frame: state.frame, root: serializeNode(rootMirror) });
+  send({ t: "tree", frame: state.frame, root: serializeMountedTree() });
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +622,8 @@ function sendTree(): void {
 interface TreeNodeJson {
   i: number;
   t: string;
+  /** DevTools-only grouping node; it has no native node to inspect. */
+  v?: 1;
   n?: string;
   c?: string;
   x?: string;
@@ -581,12 +678,38 @@ function serializeNode(node: NodeMirror): TreeNodeJson {
   return out;
 }
 
+function namedSurfaceRoot(node: NodeMirror, name: string): TreeNodeJson {
+  const out = serializeNode(node);
+  if (!out.n) out.n = name;
+  return out;
+}
+
+function serializeMountedTree(): TreeNodeJson {
+  if (!hasAuxiliarySurface()) return serializeNode(rootMirror);
+  return {
+    i: 0,
+    t: "surfaces",
+    v: 1,
+    n: "Displays",
+    k: [
+      namedSurfaceRoot(rootMirror, "Primary display"),
+      namedSurfaceRoot(getAuxiliarySurfaceRoots().native, "Auxiliary display"),
+    ],
+  };
+}
+
 function countNodes(node: NodeMirror): number {
   let n = 1;
   forEachTreeChild(node, (child) => {
     n += countNodes(child);
   });
   return n;
+}
+
+function countMountedNodes(): number {
+  let count = countNodes(rootMirror);
+  if (hasAuxiliarySurface()) count += countNodes(getAuxiliarySurfaceRoots().native);
+  return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +791,11 @@ const api = {
   replay: (tape: Tape): void => {
     state.replayMasks = expandTape(tape);
     state.replayAnalog = tape.analog ? expandTapeAnalog(tape) : null;
+    state.replayRightAnalog = tape.rightAnalog ? expandTapeRightAnalog(tape) : null;
     state.replayTouch = tape.touch ? expandTapeTouch(tape) : null;
+    state.replayTouchSurfaces = tape.touchSurfaces
+      ? expandTapeTouchSurfaces(tape)
+      : null;
     state.replayAt = 0;
   },
 };

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  generatePocketSystemV1Schema,
+  POCKET_SYSTEM_SCHEMA_ID,
+} from "../contracts/spec/pocket-system.ts";
+import {
   generatePocketManifestV2Schema,
   POCKET_MANIFEST_SCHEMA_ID,
   type PocketManifestV2,
@@ -22,6 +26,7 @@ import {
   validatePlatformContractRegistry,
 } from "../framework/src/manifest/resolve.ts";
 import { validatePocketManifest } from "../framework/src/manifest/validate.ts";
+import { validatePocketSystem } from "../framework/src/manifest/system.ts";
 
 const fixtureUrl = (name: string) => new URL(`./fixtures/manifests/${name}.json`, import.meta.url);
 const portableInput: unknown = await Bun.file(fixtureUrl("portable-psp")).json();
@@ -54,6 +59,29 @@ const syntheticTargetDefinitions = {
       "input.analog.left",
       "input.buttons",
       "input.touch",
+      "text.glyphs.baked",
+    ],
+  },
+  "dual-test": {
+    hostAbi: 8,
+    platform: "dual-test",
+    form: "takeover",
+    display: {
+      physicalViewport: [400, 240],
+      logicalViewports: [[400, 240]],
+      presentations: ["native"],
+      rasterDensity: 1,
+      auxiliary: {
+        physicalViewport: [320, 240],
+        logicalViewports: [[320, 240]],
+        presentations: ["native"],
+        rasterDensity: 1,
+      },
+    },
+    capabilities: [
+      "input.buttons",
+      "input.touch.auxiliary",
+      "display.auxiliary",
       "text.glyphs.baked",
     ],
   },
@@ -137,11 +165,56 @@ describe("pocket.json v2 schema", () => {
       message: 'expected one of "guest", "aot"',
     });
   });
+
+  test("accepts a fixed auxiliary surface and rejects undeclared fields", () => {
+    const dual = structuredClone(portableInput) as Record<string, any>;
+    dual.app.surfaces = {
+      auxiliary: { fixed: { logical: [320, 240], presentation: "native" } },
+    };
+    expect(validatePocketManifest(dual).ok).toBe(true);
+
+    dual.app.surfaces.auxiliary.panel = "bottom";
+    const result = validatePocketManifest(dual);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.diagnostics).toContainEqual({
+      code: "schema.additionalProperty",
+      path: "/app/surfaces/auxiliary/panel",
+      message: "unknown property",
+    });
+  });
+});
+
+describe("Pocket System v1 schema", () => {
+  test("uses the deployed schema path and matches the committed JSON Schema", async () => {
+    expect(POCKET_SYSTEM_SCHEMA_ID).toBe(
+      "https://pocketjs.dev/schema/pocket-system-1.json",
+    );
+    const committed = await Bun.file(
+      new URL("../contracts/schema/pocket-system-1.json", import.meta.url),
+    ).text();
+    expect(committed).toBe(generatePocketSystemV1Schema());
+  });
+
+  test("validates a managed desktop installation model", async () => {
+    const system = await Bun.file(
+      new URL("./fixtures/systems/managed-desktop.json", import.meta.url),
+    ).json();
+    expect(validatePocketSystem(system).ok).toBe(true);
+  });
 });
 
 describe("platform registry", () => {
   test("production advertises only the truthful stock-host profiles", () => {
-    expect(Object.keys(POCKET_TARGETS)).toEqual(["psp", "vita", "pocketbook", "macos-widget"]);
+    expect(Object.keys(POCKET_TARGETS)).toEqual([
+      "psp",
+      "vita",
+      "pocketbook",
+      "macos-widget",
+      "macos-app",
+      "linux-app",
+      "web-app",
+    ]);
     expect(validatePlatformContractRegistry(POCKET_PLATFORM_CONTRACTS)).toEqual([]);
     expect(POCKET_TARGETS.psp.capabilities).toEqual([
       "input.analog.left",
@@ -193,6 +266,73 @@ describe("platform registry", () => {
       min: [240, 180],
       max: [4096, 4096],
     });
+    // The gpui app frame: same desktop wire generation as the widget shell
+    // (hostAbi 4 adds compositor surfaces), a general window that ALSO hosts fixed-viewport apps
+    // (acceptsFixed), and host text layout instead of runtime glyph baking.
+    // Deliberately NARROW: only host-generic behavior registers — pointer/
+    // text/IME/clipboard reach the note via its companion svc adapter and
+    // are not target capabilities here (the platforms.ts header rule).
+    expect(POCKET_TARGETS["macos-app"].hostAbi).toBe(4);
+    expect(POCKET_TARGETS["macos-app"].form).toBe("window");
+    expect(POCKET_TARGETS["macos-app"].capabilities).toEqual([
+      "input.buttons",
+      "display.viewport.live",
+      "text.glyphs.baked",
+      "text.layout.native",
+    ]);
+    expect(POCKET_TARGETS["macos-app"].roleCapabilities).toEqual({
+      systemUI: ["ui.compositor-surfaces"],
+    });
+    expect(POCKET_TARGETS["macos-app"].display.dynamicViewport).toEqual({
+      min: [240, 180],
+      max: [4096, 4096],
+      acceptsFixed: true,
+    });
+    expect(POCKET_TARGETS["linux-app"]).toEqual({
+      hostAbi: 4,
+      platform: "linux",
+      form: "window",
+      display: {
+        physicalViewport: [1280, 800],
+        logicalViewports: [[800, 600]],
+        dynamicViewport: {
+          min: [240, 180],
+          max: [4096, 4096],
+          acceptsFixed: true,
+        },
+        presentations: ["native"],
+        rasterDensity: 1,
+      },
+      capabilities: [
+        "input.buttons",
+        "display.viewport.live",
+        "text.glyphs.baked",
+        "text.layout.native",
+      ],
+      roleCapabilities: { systemUI: ["ui.compositor-surfaces"] },
+    });
+    expect(POCKET_TARGETS["web-app"]).toEqual({
+      hostAbi: 4,
+      platform: "web",
+      form: "window",
+      display: {
+        physicalViewport: [800, 600],
+        logicalViewports: [[800, 600]],
+        dynamicViewport: {
+          min: [320, 240],
+          max: [4096, 4096],
+          acceptsFixed: true,
+        },
+        presentations: ["native"],
+        rasterDensity: 1,
+      },
+      capabilities: [
+        "input.buttons",
+        "display.viewport.live",
+        "text.glyphs.baked",
+      ],
+      roleCapabilities: { systemUI: ["ui.compositor-surfaces"] },
+    });
   });
 
   test("TargetId and capability registries extend without changing the resolver", () => {
@@ -224,9 +364,47 @@ describe("platform registry", () => {
       message: "widget-form targets must declare display.dynamicViewport",
     });
   });
+
 });
 
 describe("semantic resolution", () => {
+  test("the note resolves native text on macos-app and baked text elsewhere", async () => {
+    // The flagship contract behind tools/macos.ts's --native-text flag:
+    // text.layout.native is an ENHANCEMENT — true exactly where the gpui
+    // host implements it, false on the widget shell, and never a hard
+    // requirement (the note keeps running on macos-widget).
+    const note = await Bun.file(new URL("../apps/note/pocket.json", import.meta.url)).json();
+    const onApp = validateAndResolveBuildPlan(note, { target: "macos-app" });
+    expect(onApp.ok).toBe(true);
+    if (!onApp.ok) return;
+    expect(onApp.plan.features["text.layout.native"]).toBe(true);
+    expect(onApp.plan.features["text.glyphs.runtime"]).toBe(false);
+    expect(onApp.plan.target.hostAbi).toBe(4);
+
+    const onWidget = validateAndResolveBuildPlan(note, { target: "macos-widget" });
+    expect(onWidget.ok).toBe(true);
+    if (!onWidget.ok) return;
+    expect(onWidget.plan.features["text.layout.native"]).toBe(false);
+    expect(onWidget.plan.features["text.glyphs.runtime"]).toBe(true);
+
+    // The companion adapter is PLAN data now (issue #295): hosts build
+    // their svc allowlist and adapter wiring from this list, never from
+    // app-name conventions; the viewport policy rides along so hosts
+    // derive size-locking from the plan too.
+    expect(onApp.plan.companions).toEqual(["note"]);
+    expect(onApp.plan.viewport.policy).toBe("dynamic");
+    const hero = await Bun.file(new URL("../apps/hero/pocket.json", import.meta.url)).json();
+    const heroOnApp = validateAndResolveBuildPlan(hero, { target: "macos-app" });
+    expect(heroOnApp.ok).toBe(true);
+    if (!heroOnApp.ok) return;
+    expect(heroOnApp.plan.companions).toEqual([]);
+    expect(heroOnApp.plan.viewport.policy).toBe("dynamic");
+    const heroOnPsp = validateAndResolveBuildPlan(hero, { target: "psp" });
+    expect(heroOnPsp.ok).toBe(true);
+    if (!heroOnPsp.ok) return;
+    expect(heroOnPsp.plan.viewport.policy).toBe("fixed");
+  });
+
   test("guest resolution honors the declared execution classes", () => {
     const dual = structuredClone(portableInput) as Record<string, any>;
     dual.execution = { classes: ["guest", "aot"] };
@@ -252,6 +430,7 @@ describe("semantic resolution", () => {
     expect(result.plan.app).toEqual({
       id: "dev.pocket-stack.telemetry",
       title: "Pocket Telemetry",
+      version: "0.1.0",
       entry: "app/main.tsx",
       output: "main",
       framework: "solid",
@@ -261,6 +440,7 @@ describe("semantic resolution", () => {
       physical: [480, 272],
       presentation: "integer-fit",
       rasterDensity: 1,
+      policy: "fixed",
     });
     expect(result.plan.features).toEqual({
       "input.analog.left": true,
@@ -328,35 +508,45 @@ describe("semantic resolution", () => {
 
   test("every committed demo manifest lands on the expected admission matrix", async () => {
     const { readdirSync, existsSync } = await import("node:fs");
-    // demo -> [psp, vita, macos-widget] admission. Fixed-only console demos
-    // stay off the desktop widget (its profile presents "native" over a
-    // dynamic viewport, not the console integer-fit contract); Hero declares
-    // both policies, while the note is dynamic-only. A new demo missing here
-    // fails the test on purpose.
-    const expected: Record<string, [boolean, boolean, boolean]> = {
-      cafe: [true, true, false],
-      cards: [true, true, false],
-      chrome: [true, true, false],
-      cursor: [true, true, false],
-      gallery: [true, true, false],
-      hero: [true, true, true],
-      "hero-vue-sfc": [true, true, false],
-      "hero-vue-vapor": [true, true, false],
-      im: [true, true, false],
-      "iphone2g-demo": [false, false, false], // admitted only by the private iphone2g-dev profile
-      "ipod-nano": [false, false, false], // admitted by the package-shaped macos-embedded target
-      launcher: [true, true, false], // the Cover Flow deck (docs/LAUNCHER.md) is an ordinary console app
-      library: [true, true, false],
-      motions: [true, true, false],
-      music: [true, true, false],
-      note: [false, false, true],
-      notifications: [true, true, false],
-      settings: [true, true, false],
-      stats: [true, true, false],
-      "vue-sfc-lab": [true, true, false],
-      zoomlab: [true, true, false],
+    // demo -> [psp, vita, macos-widget, macos-app] admission. Fixed-only
+    // console demos stay off the desktop widget (its profile presents
+    // "native" over a dynamic viewport, not the console integer-fit
+    // contract) but land on the macos-app frame, which hosts fixed apps
+    // size-locked (acceptsFixed); Hero declares both policies, while the
+    // note is dynamic-only. A new demo missing here fails the test on
+    // purpose.
+    const expected: Record<string, [boolean, boolean, boolean, boolean]> = {
+      "3ds-demo": [false, false, false, false], // requires the private 3ds-dev profile's auxiliary display and touch contracts
+      "blackberry-classic-demo": [false, false, false, true], // built by the private blackberry-{qnx,android}-dev profiles; macos-app also admits its fixed 360x360 buttons+glyphs contract
+      cafe: [true, true, false, true],
+      cards: [true, true, false, true],
+      chrome: [true, true, false, true],
+      clear: [false, false, false, false], // admitted only by the private ipodtouch4-dev profile (fixed 320x480 portrait touch surface)
+      cursor: [true, true, false, true],
+      gallery: [true, true, false, true],
+      hero: [true, true, true, true],
+      "hero-vue-sfc": [true, true, false, true],
+      "hero-vue-vapor": [true, true, false, true],
+      im: [true, true, false, true],
+      "iphone16-demo": [false, true, false, false], // targets the private ios-dev profile; vita shares its touch + integer-fit contract
+      "iphone2g-demo": [false, false, false, false], // admitted only by the private iphone2g-dev profile
+      "iphone4s-demo": [false, false, false, false], // admitted only by the private iphone4s-dev profile
+      "ipodtouch-demo": [false, false, false, false], // admitted only by the private ipodtouch-dev profile
+      "meizu-m8-demo": [false, false, false, false], // admitted only by the private meizu-m8-dev profile
+      nsengine: [false, true, false, false], // targets the private ios-dev profile; vita shares its touch + integer-fit contract
+      "ipod-nano": [false, false, false, false], // admitted by the package-shaped macos-embedded target
+      launcher: [true, true, false, true], // the Cover Flow deck (docs/LAUNCHER.md) is an ordinary console app
+      library: [true, true, false, true],
+      motions: [true, true, false, true],
+      music: [true, true, false, true],
+      note: [false, false, true, true],
+      notifications: [true, true, false, true],
+      settings: [true, true, false, true],
+      stats: [true, true, false, true],
+      "vue-sfc-lab": [true, true, false, true],
+      zoomlab: [true, true, false, true],
     };
-    const targets = ["psp", "vita", "macos-widget"] as const;
+    const targets = ["psp", "vita", "macos-widget", "macos-app"] as const;
     for (const demo of readdirSync(new URL("../apps/", import.meta.url)).sort()) {
       const url = new URL(`../apps/${demo}/pocket.json`, import.meta.url);
       if (!existsSync(url)) continue;
@@ -367,6 +557,15 @@ describe("semantic resolution", () => {
         expect(`${demo}@${target}:${result.ok}`).toBe(`${demo}@${target}:${expected[demo][i]}`);
       });
     }
+    const systemUI = await Bun.file(
+      new URL("./fixtures/manifests/system-ui.json", import.meta.url),
+    ).json();
+    expect(
+      validateAndResolveBuildPlan(systemUI, {
+        target: "macos-app",
+        role: "systemUI",
+      }).ok,
+    ).toBe(true);
     // The demo shelf rule the site build applies: only psp-admissible
     // manifests are shown — the note stays off the landing/playground.
     const note = await Bun.file(new URL("../apps/note/pocket.json", import.meta.url)).json();
@@ -453,6 +652,7 @@ describe("semantic resolution", () => {
       physical: [960, 544],
       presentation: "integer-fit",
       rasterDensity: 2,
+      policy: "fixed",
     });
     expect(result.plan.features).toEqual({
       "input.analog.left": true,
@@ -512,6 +712,7 @@ describe("semantic resolution", () => {
       physical: [960, 544],
       presentation: "integer-fit",
       rasterDensity: 2,
+      policy: "fixed",
     });
     expect(Object.values(result.plan.features).every(Boolean)).toBe(true);
   });
@@ -535,5 +736,124 @@ describe("semantic resolution", () => {
     if (!result.ok) return;
     expect(result.plan.target.hostAbi).toBe(2);
     expect(result.plan.features["input.touch"]).toBe(true);
+  });
+
+  test("resolves auxiliary display and touch as separate capabilities", () => {
+    const dual = structuredClone(portableInput) as Record<string, any>;
+    dual.app.viewport.logical = [400, 240];
+    dual.app.viewport.presentation = "native";
+    dual.app.surfaces = {
+      auxiliary: { fixed: { logical: [320, 240], presentation: "native" } },
+    };
+    dual.engine.capabilities.requires = [
+      "input.buttons",
+      "text.glyphs.baked",
+      "display.auxiliary",
+      "input.touch.auxiliary",
+    ];
+
+    const result = resolveBuildPlan(manifest(dual), { target: "dual-test" }, SYNTHETIC_CONTRACTS);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.plan.surfaces).toEqual({
+      auxiliary: {
+        logical: [320, 240],
+        physical: [320, 240],
+        presentation: "native",
+        rasterDensity: 1,
+      },
+    });
+    expect(result.plan.features).toEqual({
+      "display.auxiliary": true,
+      "input.buttons": true,
+      "input.touch.auxiliary": true,
+      "text.glyphs.baked": true,
+    });
+    expect(result.plan.features).not.toHaveProperty("input.touch");
+    expect(verifyPlanHash(result.plan)).toBe(true);
+  });
+
+  test("enforces auxiliary surface declarations, dependencies and geometry", () => {
+    const base = structuredClone(portableInput) as Record<string, any>;
+    base.app.viewport.logical = [400, 240];
+    base.app.viewport.presentation = "native";
+
+    const missingSurface = structuredClone(base);
+    missingSurface.engine.capabilities.requires.push("display.auxiliary");
+    const missingResult = resolveBuildPlan(
+      manifest(missingSurface),
+      { target: "dual-test" },
+      SYNTHETIC_CONTRACTS,
+    );
+    expect(missingResult.ok).toBe(false);
+    if (!missingResult.ok) {
+      expect(missingResult.diagnostics.map((item) => item.code)).toContain(
+        "surface.auxiliaryDeclarationMismatch",
+      );
+    }
+
+    const touchWithoutDisplay = structuredClone(base);
+    touchWithoutDisplay.engine.capabilities.requires.push("input.touch.auxiliary");
+    const dependencyResult = resolveBuildPlan(
+      manifest(touchWithoutDisplay),
+      { target: "dual-test" },
+      SYNTHETIC_CONTRACTS,
+    );
+    expect(dependencyResult.ok).toBe(false);
+    if (!dependencyResult.ok) {
+      expect(dependencyResult.diagnostics.map((item) => item.code)).toContain(
+        "capability.dependency",
+      );
+    }
+
+    const wrongGeometry = structuredClone(base);
+    wrongGeometry.engine.capabilities.requires.push("display.auxiliary");
+    wrongGeometry.app.surfaces = {
+      auxiliary: { fixed: { logical: [400, 240], presentation: "native" } },
+    };
+    const geometryResult = resolveBuildPlan(
+      manifest(wrongGeometry),
+      { target: "dual-test" },
+      SYNTHETIC_CONTRACTS,
+    );
+    expect(geometryResult.ok).toBe(false);
+    if (!geometryResult.ok) {
+      expect(geometryResult.diagnostics.map((item) => item.code)).toEqual(
+        expect.arrayContaining(["surface.logicalUnsupported", "surface.nativeMismatch"]),
+      );
+    }
+  });
+
+  test("rejects target profiles whose auxiliary facts and capabilities drift", () => {
+    const missingFacts = definePlatformContractRegistry(
+      SYNTHETIC_CAPABILITIES,
+      defineTargetRegistry({
+        broken: {
+          ...syntheticTargetDefinitions["dual-test"],
+          display: {
+            physicalViewport: [400, 240],
+            logicalViewports: [[400, 240]],
+            presentations: ["native"],
+            rasterDensity: 1,
+          },
+        },
+      }),
+    );
+    expect(validatePlatformContractRegistry(missingFacts).map((item) => item.code)).toContain(
+      "registry.auxiliaryDisplayMismatch",
+    );
+
+    const touchWithoutDisplay = definePlatformContractRegistry(
+      SYNTHETIC_CAPABILITIES,
+      defineTargetRegistry({
+        broken: {
+          ...syntheticTargetDefinitions["vita-test"],
+          capabilities: ["input.touch.auxiliary"],
+        },
+      }),
+    );
+    expect(validatePlatformContractRegistry(touchWithoutDisplay).map((item) => item.code)).toContain(
+      "registry.auxiliaryTouchWithoutDisplay",
+    );
   });
 });

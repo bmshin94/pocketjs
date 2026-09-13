@@ -1,3 +1,5 @@
+import { readIdfHostExtension } from "../framework/src/manifest/idf-host.ts";
+import { BuildInputs } from "../framework/compiler/build-inputs.ts";
 // tools/build.ts <app> — the TWO-PASS app build (docs/DESIGN.md "Build pipeline").
 //
 //   bun tools/build.ts apps/hero/app.tsx    (or just `hero`)
@@ -40,7 +42,7 @@ import {
 } from "../framework/compiler/jsx-plugin.ts";
 import type { PocketConfig } from "../framework/src/config.ts";
 import { verifyPlanHash, type ResolvedBuildPlan } from "../framework/src/manifest/plan.ts";
-import { registerAnimationTheme } from "../framework/compiler/animation.ts";
+import { registerAnimationTheme, setAnimationTickRate } from "../framework/compiler/animation.ts";
 import { compileClasses, generateStylesModule } from "../framework/compiler/tailwind.ts";
 import { bakeAtlases } from "../framework/compiler/bake-font.ts";
 import { bakeSvg } from "../framework/compiler/bake-svg.ts";
@@ -87,7 +89,10 @@ let configFlagged = false;
 let useConfig = true;
 let planPath: string | undefined;
 let densityFlag: number | undefined;
+let hzFlag: number | undefined;
 let projectRoot = process.cwd();
+let inputsFile: string | undefined;
+const buildInputs = new BuildInputs();
 for (const a of args) {
   if (a.startsWith("--extra-chars=")) extraChars = a.slice("--extra-chars=".length);
   else if (a.startsWith("--font-regular=")) regularFontPath = resolvePath(a.slice("--font-regular=".length));
@@ -99,6 +104,8 @@ for (const a of args) {
   else if (a.startsWith("--project-root=")) projectRoot = resolvePath(a.slice("--project-root=".length));
   else if (a.startsWith("--outdir=")) DIST = resolvePath(a.slice("--outdir=".length)) + "/";
   else if (a.startsWith("--density=")) densityFlag = Number(a.slice("--density=".length));
+  else if (a.startsWith("--hz=")) hzFlag = Number(a.slice("--hz=".length));
+  else if (a.startsWith("--inputs-file=")) inputsFile = resolvePath(a.slice("--inputs-file=".length));
   else if (!a.startsWith("-")) appArg = a;
 }
 
@@ -116,7 +123,7 @@ if (planPath) {
 }
 
 if (!appArg) {
-  console.error("usage: bun tools/build.ts <app.tsx | app name> [--plan=<resolved-plan.json>] [--framework=solid|vue-vapor|octane] [--extra-chars=...] [--density=N]");
+  console.error("usage: bun tools/build.ts <app.tsx | app name> [--plan=<resolved-plan.json>] [--framework=solid|vue-vapor|octane] [--extra-chars=...] [--density=N] [--hz=N]");
   process.exit(1);
 }
 
@@ -162,6 +169,9 @@ function resolveEntry(arg: string): string {
 }
 
 const requestedEntry = resolveEntry(appArg);
+buildInputs.optional(configPath);
+buildInputs.optional(join(dirname(requestedEntry), "pocket.config.ts"));
+buildInputs.optional(join(projectRoot, "tsconfig.json"));
 // An app directory can carry its own pocket.config.ts (theme/keyframes local
 // to the app); it wins over the repo root config unless --config was given.
 if (!configFlagged && useConfig) {
@@ -205,8 +215,21 @@ if (densityFlag !== undefined && (!Number.isInteger(densityFlag) || densityFlag 
   throw new Error("PocketJS build: --density wants an integer from 1 through 255");
 }
 const rasterDensity = buildPlan?.viewport.rasterDensity ?? densityFlag ?? 1;
+
+// Tick rate: the realm's virtual-time step, baked into the bundle because
+// every ms-to-frame conversion in the framework resolves against it. An
+// ESP-IDF host profile owns the rate; low-level builds may still pass --hz.
+if (hzFlag !== undefined && (!Number.isInteger(hzFlag) || hzFlag < 1 || hzFlag > 240)) {
+  throw new Error("PocketJS build: --hz wants an integer from 1 through 240");
+}
+const idfHost = readIdfHostExtension(buildPlan?.hostExtension);
+if (idfHost && hzFlag !== undefined && hzFlag !== idfHost.tickHz) {
+  throw new Error("PocketJS build: --hz cannot override an ESP-IDF host profile");
+}
+const tickHz = idfHost?.tickHz ?? hzFlag ?? 60;
 console.log(
   `PocketJS build: ${appName} (${entry}, framework=${framework}` +
+    `${tickHz === 60 ? "" : `, ${tickHz}Hz`}` +
     `${buildPlan ? `, target=${buildPlan.target.id}, raster=${rasterDensity}x, plan=${buildPlan.planHash.slice(0, 20)}…` : ""})`,
 );
 
@@ -254,8 +277,9 @@ async function walk(file: string): Promise<void> {
   // output [R]. Other generated modules (e.g. the launcher's registry) are
   // ordinary app data whose literals — cover asset paths, title glyphs —
   // pass 1 must see like any hand-written module's.
-  if (file.endsWith("/styles.generated.ts")) return;
+  if (file.replace(/\\/g, "/").endsWith("/styles.generated.ts")) return;
   const src = await Bun.file(file).text();
+  buildInputs.add(file);
   // Throws with a code frame on lint errors.
   const res = await transformFile(file, src, framework, { features: buildPlan?.features });
   for (const s of res.classStrings) {
@@ -279,6 +303,9 @@ console.log(`  pass 1: ${visited.size} module(s), ${classStrings.length} candida
 // ---------------------------------------------------------------------------
 
 registerAnimationTheme(config.theme);
+// Keyframe timelines are frame-baked; they must count frames at the same
+// rate the realm ticks (transition-* stays in ms and converts at runtime).
+setAnimationTickRate(tickHz);
 const styles = compileClasses(classStrings);
 if (styles.records.length === 0) {
   console.warn("  tailwind: no class literals compiled — is the app unstyled?");
@@ -294,6 +321,25 @@ console.log(
     `${Object.keys(styles.ids).length} literal(s) -> framework/src/styles.generated.ts`,
 );
 
+// Optional per-app font sidecar: <appDir>/fonts.json names fallback faces
+// tried, in order, for codepoints the slot's own face does not map — an icon
+// font (Nerd Font symbols, say) whose glyphs must share the atlas with text.
+// Paths are relative to the app directory, so the face travels with the app.
+interface FontsManifest {
+  fallback?: string[];
+}
+const fontsManifestPath = join(dirname(entry), "fonts.json");
+let fallbackTtfs: string[] = [];
+if (existsSync(fontsManifestPath)) {
+  buildInputs.add(fontsManifestPath);
+  const fontsManifest = JSON.parse(await Bun.file(fontsManifestPath).text()) as FontsManifest;
+  fallbackTtfs = (fontsManifest.fallback ?? []).map((p) => resolvePath(dirname(entry), p));
+  for (const p of fallbackTtfs) {
+    if (!existsSync(p)) throw new Error(`PocketJS build: fonts.json fallback face not found: ${p}`);
+  }
+  if (fallbackTtfs.length) console.log(`  fonts: ${fallbackTtfs.length} fallback face(s) from fonts.json`);
+}
+
 const atlases = await bakeAtlases({
   codepoints,
   slots: styles.usedFontSlots,
@@ -301,6 +347,8 @@ const atlases = await bakeAtlases({
   rasterDensity,
   regularTtf: regularFontPath,
   boldTtf: boldFontPath,
+  onRead: path => buildInputs.add(path),
+  fallbackTtfs,
 });
 for (const a of atlases) {
   console.log(
@@ -326,6 +374,7 @@ interface SpriteMeta {
   psm?: number;
 }
 const spriteManifestPath = join(appDir, "sprites.json");
+buildInputs.optional(spriteManifestPath);
 const spriteMeta: Record<string, SpriteMeta> = existsSync(spriteManifestPath)
   ? (JSON.parse(await Bun.file(spriteManifestPath).text()) as Record<string, SpriteMeta>)
   : {};
@@ -338,12 +387,14 @@ interface ImageMeta {
   psm?: number;
 }
 const imageManifestPath = join(appDir, "images.json");
+buildInputs.optional(imageManifestPath);
 const imageMeta: Record<string, ImageMeta> = existsSync(imageManifestPath)
   ? (JSON.parse(await Bun.file(imageManifestPath).text()) as Record<string, ImageMeta>)
   : {};
 const imageNames = classStrings.filter((s) => /^[\w./-]+\.(?:png|svg)$/i.test(s));
 for (const name of imageNames) {
   const candidates = [join(appDir, name), join(ROOT, "assets/images/", name), join(ROOT, "assets/", name)];
+  candidates.forEach(path => buildInputs.optional(path));
   const found = candidates.find((c) => existsSync(c));
   let img;
   if (found) {
@@ -358,6 +409,7 @@ for (const name of imageNames) {
       // sprite's frame grid stays logical because every atlas dimension is
       // scaled by the same integer density.
       const variant = densityVariantPath(found, rasterDensity);
+      buildInputs.optional(variant);
       if (variant !== found && existsSync(variant)) {
         const highDensity = decodePng(new Uint8Array(await Bun.file(variant).arrayBuffer()));
         assertDensityVariantDimensions(base, highDensity, rasterDensity, found, variant);
@@ -412,6 +464,7 @@ for (const name of imageNames) {
 // appended verbatim as u8 blobs. This keeps expensive offline bakes out of the
 // build: the build just splices bytes it can't (and needn't) regenerate.
 const pakManifestPath = join(appDir, "pak.json");
+buildInputs.optional(pakManifestPath);
 if (existsSync(pakManifestPath)) {
   const rawEntries = JSON.parse(await Bun.file(pakManifestPath).text()) as Array<{ key: string; file: string }>;
   let rawBytes = 0;
@@ -422,6 +475,8 @@ if (existsSync(pakManifestPath)) {
       process.exit(1);
     }
     const densityPath = densityVariantPath(basePath, rasterDensity);
+    buildInputs.add(basePath);
+    buildInputs.optional(densityPath);
     const path = densityPath !== basePath && existsSync(densityPath) ? densityPath : basePath;
     const data = new Uint8Array(await Bun.file(path).arrayBuffer());
     blobs.push({ key: e.key, dtype: PAK_DTYPE.u8, data });
@@ -453,6 +508,7 @@ if (!existsSync(frameworkConfig.rendererPath)) {
 // browser-mode Solid runtime even when the app has its own node_modules.
 const result = await Bun.build({
   entrypoints: [entry],
+  root: process.cwd(),
   outdir: DIST,
   naming: `${outName}.js`,
   format: "iife",
@@ -469,11 +525,13 @@ const result = await Bun.build({
     __POCKET_HOST_ABI__: String(buildPlan?.target.hostAbi ?? 0),
     __POCKET_FEATURES__: JSON.stringify(buildPlan?.features ?? {}),
     __POCKET_PIXEL_RATIO__: String(rasterDensity),
+    __POCKET_TICK_HZ__: String(tickHz),
     ...(framework === "vue-vapor"
       ? { document: "globalThis.__pocketDocument" }
       : {}),
   },
   minify: false,
+  metafile: true,
   sourcemap: "none",
   plugins: [jsxPlugin(framework, {
     entry,
@@ -487,6 +545,12 @@ if (!result.success) {
   process.exit(1);
 }
 const bundle = result.outputs.find((o) => o.path.endsWith(".js"));
+if (inputsFile) {
+  buildInputs.metafile(result.metafile);
+  await buildInputs.compiler([join(ROOT, "tools/build.ts"), join(ROOT, "tools/pocket.ts"),
+    ...(useConfig && existsSync(configPath) ? [configPath] : [])], ROOT);
+  await Bun.write(inputsFile, JSON.stringify(buildInputs.paths(), null, 2) + "\n");
+}
 console.log(`  pass 2: ${DIST}${outName}.js (${bundle ? (await bundle.arrayBuffer()).byteLength : 0} bytes)`);
 console.log("PocketJS build: done");
 

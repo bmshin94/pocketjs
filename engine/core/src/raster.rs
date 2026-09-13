@@ -40,8 +40,11 @@
 use crate::damage::{
     DamageError, DamagePlan, DamagePolicy, DamageRect, DamageTarget, DamageTracker,
 };
+use crate::resources::RenderResources;
 use crate::spec::{self, draw_op};
-use crate::{TexView, Ui};
+use crate::TexView;
+#[cfg(test)]
+use crate::Ui;
 
 pub const MAX_RENDER_SCALE: u32 = 4;
 const DAMAGE_SIGNATURE_RGBA8: u64 = u32::from_be_bytes(*b"RGBA") as u64;
@@ -337,7 +340,7 @@ fn lerp_color(from: u32, to: u32, f: f32) -> u32 {
 
 /// Execute `words` into the UI's logical viewport at one sample per pixel.
 /// The stock viewport remains 480x272, preserving the legacy golden output.
-pub fn render(ui: &Ui, words: &[u32], fb: &mut [u8]) {
+pub fn render(ui: &impl RenderResources, words: &[u32], fb: &mut [u8]) {
     render_scaled(ui, words, fb, 1);
 }
 
@@ -349,7 +352,7 @@ pub fn render(ui: &Ui, words: &[u32], fb: &mut [u8]) {
 /// density.
 /// `ui` supplies font atlases and textures. The framebuffer is cleared to
 /// opaque black first (the PSP host clears the draw buffer the same way).
-pub fn render_scaled(ui: &Ui, words: &[u32], fb: &mut [u8], scale: u32) {
+pub fn render_scaled(ui: &impl RenderResources, words: &[u32], fb: &mut [u8], scale: u32) {
     let mut target = RgbaTarget::<false> { bytes: fb };
     render_scaled_impl(ui, words, &mut target, scale, true);
 }
@@ -360,20 +363,34 @@ pub fn render_scaled(ui: &Ui, words: &[u32], fb: &mut [u8], scale: u32) {
 /// but fused into the rasterizer so hosts skip a per-frame reorder copy.
 /// Output determinism matches the RGBA path pixel-for-pixel; only the byte
 /// placement differs.
-pub fn render_scaled_argb(ui: &Ui, words: &[u32], fb: &mut [u8], scale: u32) {
+pub fn render_scaled_argb(ui: &impl RenderResources, words: &[u32], fb: &mut [u8], scale: u32) {
     let mut target = RgbaTarget::<true> { bytes: fb };
     render_scaled_impl(ui, words, &mut target, scale, true);
 }
 
 /// Execute a complete DrawList into a little-endian RGB565 framebuffer.
-pub fn render_scaled_rgb565(ui: &Ui, words: &[u32], fb: &mut [u16], scale: u32) {
+pub fn render_scaled_rgb565(ui: &impl RenderResources, words: &[u32], fb: &mut [u16], scale: u32) {
     let mut target = Rgb565Target { pixels: fb };
     render_scaled_impl(ui, words, &mut target, scale, true);
 }
 
+/// Execute DrawList words over an existing RGBA8 framebuffer without
+/// clearing it. Render backends composite these into their own scene (the
+/// gpui tri-batch fallback keeps uncovered pixels transparent this way —
+/// the clearing variants paint the full-frame opaque-black background).
+pub fn render_scaled_over(ui: &impl RenderResources, words: &[u32], fb: &mut [u8], scale: u32) {
+    let mut target = RgbaTarget::<false> { bytes: fb };
+    render_scaled_impl(ui, words, &mut target, scale, false);
+}
+
 /// Execute DrawList words over an existing RGB565 framebuffer without
 /// clearing it. Hardware backends use this for ordered fallback segments.
-pub fn render_scaled_rgb565_over(ui: &Ui, words: &[u32], fb: &mut [u16], scale: u32) {
+pub fn render_scaled_rgb565_over(
+    ui: &impl RenderResources,
+    words: &[u32],
+    fb: &mut [u16],
+    scale: u32,
+) {
     let mut target = Rgb565Target { pixels: fb };
     render_scaled_impl(ui, words, &mut target, scale, false);
 }
@@ -388,7 +405,7 @@ pub fn render_scaled_rgb565_over(ui: &Ui, words: &[u32], fb: &mut [u16], scale: 
 /// compact window. Hardware backends use this for ordered software fallback
 /// while rendering a dirty strip.
 pub fn render_scaled_rgb565_window_over(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u16],
     scale: u32,
@@ -440,7 +457,7 @@ pub fn render_scaled_rgb565_window_over(
 /// Each region replays the complete DrawList under an additional root clip,
 /// preserving painter order for unchanged translucent operations.
 pub fn render_scaled_regions(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u8],
     scale: u32,
@@ -452,7 +469,7 @@ pub fn render_scaled_regions(
 
 /// ARGB/BGRA-memory equivalent of [`render_scaled_regions`].
 pub fn render_scaled_argb_regions(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u8],
     scale: u32,
@@ -464,7 +481,7 @@ pub fn render_scaled_argb_regions(
 
 /// RGB565 equivalent of [`render_scaled_regions`].
 pub fn render_scaled_rgb565_regions(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u16],
     scale: u32,
@@ -476,7 +493,7 @@ pub fn render_scaled_rgb565_regions(
 
 /// Incrementally render RGBA8 using one tracker per persistent framebuffer.
 pub fn render_scaled_incremental<const MAX_REGIONS: usize>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u8],
     scale: u32,
@@ -497,7 +514,7 @@ pub fn render_scaled_incremental<const MAX_REGIONS: usize>(
 
 /// Incrementally render ARGB/BGRA-memory pixels.
 pub fn render_scaled_argb_incremental<const MAX_REGIONS: usize>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u8],
     scale: u32,
@@ -518,7 +535,7 @@ pub fn render_scaled_argb_incremental<const MAX_REGIONS: usize>(
 
 /// Incrementally render native RGB565 pixels.
 pub fn render_scaled_rgb565_incremental<const MAX_REGIONS: usize>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     fb: &mut [u16],
     scale: u32,
@@ -538,7 +555,7 @@ pub fn render_scaled_rgb565_incremental<const MAX_REGIONS: usize>(
 }
 
 fn render_scaled_impl<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     target: &mut T,
     scale: u32,
@@ -552,7 +569,7 @@ fn render_scaled_impl<T: RenderTarget>(
 }
 
 fn render_scaled_regions_impl<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     target: &mut T,
     scale: u32,
@@ -572,7 +589,7 @@ fn render_scaled_regions_impl<T: RenderTarget>(
 }
 
 fn render_scaled_incremental_impl<T: RenderTarget, const MAX_REGIONS: usize>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     target: &mut T,
     scale: u32,
@@ -599,7 +616,11 @@ fn render_scaled_incremental_impl<T: RenderTarget, const MAX_REGIONS: usize>(
     Ok(plan)
 }
 
-fn target_geometry<T: RenderTarget>(ui: &Ui, target: &T, scale: u32) -> (i32, i32, Clip) {
+fn target_geometry<T: RenderTarget>(
+    ui: &impl RenderResources,
+    target: &T,
+    scale: u32,
+) -> (i32, i32, Clip) {
     assert!(
         (1..=MAX_RENDER_SCALE).contains(&scale),
         "render scale must be 1 through 4"
@@ -629,7 +650,7 @@ fn target_geometry<T: RenderTarget>(ui: &Ui, target: &T, scale: u32) -> (i32, i3
 
 #[allow(clippy::too_many_arguments)]
 fn render_damage_regions<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     target: &mut T,
     width: i32,
@@ -668,7 +689,7 @@ fn clear_black_rect<T: RenderTarget>(target: &mut T, stride: i32, rect: Clip) {
 }
 
 fn render_scaled_clipped<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     words: &[u32],
     target: &mut T,
     width: i32,
@@ -748,6 +769,14 @@ fn render_scaled_clipped<T: RenderTarget>(
                 tex_quad(ui, target, width, scale, clip, &words[i + 1..i + 9]);
                 i += 9;
             }
+            // Native compositor instruction: software surfaces have no
+            // application compositor and leave the shell fallback visible.
+            draw_op::SURFACE_QUAD => {
+                if i + 9 > words.len() {
+                    return;
+                }
+                i += 9;
+            }
             draw_op::SCISSOR => {
                 if i + 3 > words.len() || depth >= stack.len() {
                     return;
@@ -788,6 +817,18 @@ fn render_scaled_clipped<T: RenderTarget>(
                 }
                 tex_tri(ui, target, width, scale, clip, &words[i + 1..i + 12]);
                 i += 12;
+            }
+            draw_op::TEXT_RUN => {
+                // Native-text op (host text system shapes the run); the
+                // software rasterizer has no shaper, so hosts that raster run
+                // with baked measurement and never receive it. Skipped, not a
+                // stop: the op is a known member of the closed set. Variable
+                // length: 8 header words + the packed UTF-8 payload.
+                if i + 8 > words.len() {
+                    return;
+                }
+                let payload = (words[i + 7] as usize).div_ceil(4);
+                i += 8 + payload;
             }
             // The op set is closed per DrawList version; anything else means
             // corrupt data — stop instead of misinterpreting the stream.
@@ -955,7 +996,7 @@ pub fn coverage_index(
 
 #[allow(clippy::too_many_arguments)]
 fn glyph_run<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
     output_scale: i32,
@@ -1131,7 +1172,7 @@ fn sample_linear(view: &TexView, u: f32, v: f32) -> Option<(u32, u32, u32, u32)>
 //      bilinear when the texture carries the linear flag) --------------------
 
 fn tex_tri<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
     scale: i32,
@@ -1216,7 +1257,7 @@ fn tex_tri<T: RenderTarget>(
 //      carries the linear flag) --------------------------------------------------------
 
 fn tex_quad<T: RenderTarget>(
-    ui: &Ui,
+    ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
     scale: i32,
@@ -1304,6 +1345,39 @@ mod tests {
         let width = spec::SCREEN_W as usize * scale as usize;
         let offset = (y * width + x) * 4;
         fb[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn render_scaled_over_composites_without_clearing() {
+        // The OVER variant must leave untouched pixels exactly as supplied
+        // (a transparent scratch stays transparent outside the ops — the
+        // gpui tri-batch fallback's contract), while the clearing variant
+        // paints the opaque-black background everywhere.
+        let ui = Ui::new();
+        let words = [
+            spec::draw_op::RECT,
+            xy_word(10, 10),
+            wh_word(20, 20),
+            0xff00_00ff, // opaque red (ABGR)
+        ];
+        let mut over = framebuffer(1);
+        over.fill(7); // sentinel: pre-existing content
+        render_scaled_over(&ui, &words, &mut over, 1);
+        assert_eq!(rgba(&over, 1, 15, 15), [255, 0, 0, 255], "op painted");
+        assert_eq!(
+            rgba(&over, 1, 5, 5),
+            [7, 7, 7, 7],
+            "untouched pixel preserved"
+        );
+
+        let mut cleared = framebuffer(1);
+        cleared.fill(7);
+        render_scaled(&ui, &words, &mut cleared, 1);
+        assert_eq!(
+            rgba(&cleared, 1, 5, 5),
+            [0, 0, 0, 255],
+            "clearing variant blacks out"
+        );
     }
 
     #[test]
@@ -1623,12 +1697,7 @@ mod tests {
         let mut ui = Ui::new();
         ui.set_viewport(96.0, 8.0);
         let frame = |color: u32| {
-            let mut words = vec![
-                draw_op::RECT,
-                xy_word(0, 0),
-                wh_word(96, 8),
-                0xff10_0804,
-            ];
+            let mut words = vec![draw_op::RECT, xy_word(0, 0), wh_word(96, 8), 0xff10_0804];
             for index in 0..9 {
                 words.extend_from_slice(&[
                     draw_op::RECT,

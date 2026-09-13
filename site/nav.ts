@@ -15,10 +15,8 @@ export const DOC_NAV: DocSection[] = [
     items: [
       { slug: "overview", title: "Overview" },
       { slug: "getting-started", title: "Getting started" },
-      { slug: "concepts", title: "Core concepts" },
       { slug: "frameworks", title: "Frameworks" },
       { slug: "architecture", title: "Architecture" },
-      { slug: "platform-contracts", title: "Platform contracts" },
     ],
   },
   {
@@ -29,6 +27,7 @@ export const DOC_NAV: DocSection[] = [
       { slug: "reactivity", title: "Reactivity" },
       { slug: "animation", title: "Animation" },
       { slug: "input-focus", title: "Input & focus" },
+      { slug: "touch-gestures", title: "Touch & gestures" },
       { slug: "app-shell", title: "App shell & overlays" },
       { slug: "devtools", title: "DevTools" },
     ],
@@ -37,9 +36,10 @@ export const DOC_NAV: DocSection[] = [
     title: "Reference",
     items: [
       { slug: "api", title: "API reference" },
-      { slug: "tailwind", title: "Tailwind utilities" },
       { slug: "build-pipeline", title: "Build pipeline" },
       { slug: "native-contract", title: "Native contract" },
+      { slug: "platform-contracts", title: "Platform contracts" },
+      { slug: "esp-idf", title: "ESP-IDF" },
     ],
   },
 ];
@@ -55,6 +55,39 @@ export interface BlogPost {
 }
 
 export const BLOG_POSTS: BlogPost[] = [
+  {
+    slug: "blackberry-classic",
+    title:
+      "A Square Screen and a Dead Signing Server: PocketJS on the BlackBerry Classic",
+    date: "2026-08-19",
+    description:
+      "A 2014 square-screen BlackBerry, and the only thing standing between it and a freshly written frame: signing servers that went dark in January 2022. The port itself is one 547-line BB10 Core Native host over libscreen, EGL and GLES2. Around it: QNX's microkernel, where even the compositor is a user-space service; the community root project that reopened the door; a phone that appears on your desk as a network host, managed over HTTPS+CGI+XML and mounted over SMB; and an optical trackpad treated as just another relative axis.",
+    author: { name: "HalfSweet", url: "https://github.com/HalfSweet" },
+  },
+  {
+    slug: "pocketjs-on-windows-ce",
+    title: "From Message Pump to Multitouch: Windows CE, PocketJS, and the Meizu M8",
+    date: "2026-08-16",
+    description:
+      "A PocketJS port becomes an excavation of the Windows CE programming model: message pumps, HWNDs and GDI versus reactive state and declarative UI—and the shell, caches, interaction design and stubborn engineering that made the Meizu M8 feel like an iPhone.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
+  {
+    slug: "agent-native-runtime-embedded-systems",
+    title: "Taking a Step Further Towards an Agent-Native Runtime on Embedded Systems",
+    date: "2026-08-15",
+    description:
+      "Pocket Pi's Bundle-first runtime proved installable Apps on an ESP32-P4. This post derives the next architecture from first principles: protected native mechanisms, one PocketJS substrate, a JavaScript System Framework, bounded Guests, durable App Data, and a path from source-native revision to hardware portability and System OTA.",
+    author: { name: 'Siwei "Jerry" Yuan', url: "https://github.com/siwei-yuan" },
+  },
+  {
+    slug: "pocket-pi-agent-native-runtime",
+    title: "Designing Apps for Humans and Agents in an Agent-Native Runtime",
+    date: "2026-08-11",
+    description:
+      "What should an App be when both a human and an Agent can act on it? Pocket Pi derives the answer from first principles: each App is a firmware-independent product unit executed by one or more isolated PocketJS Guests, built from App-owned SQLite Data, actor-neutral Actions, and a fixed human-facing View. Tools and UI intents become two surfaces over the same behavior; a resident Pi Agent coordinates many isolated Apps and can help evolve each complete product boundary without teaching firmware what the product means.",
+    author: { name: 'Siwei "Jerry" Yuan', url: "https://github.com/siwei-yuan" },
+  },
   {
     slug: "pocket-voxel",
     title: "Pocket Voxel: A Creature-RPG From First Principles",
@@ -176,4 +209,3 @@ export const BLOG_POSTS: BlogPost[] = [
     author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
   },
 ];
-

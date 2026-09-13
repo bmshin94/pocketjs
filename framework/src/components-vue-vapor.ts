@@ -14,6 +14,7 @@ import { pushButtonHandlerBlock, onButtonPress, onFrame, type ButtonPressOptions
 import { BTN } from "./input-api.ts";
 import { pushFocusGrid, pushFocusScope, type FocusGridOptions, type FocusScopeOptions } from "./input.ts";
 import { getOverlayRoot } from "./overlay.ts";
+import { getAuxiliarySurfaceRoots } from "./display.ts";
 import {
   createCommentNode,
   createElement,
@@ -77,6 +78,15 @@ export interface SpriteProps {
   className?: string;
   sprite?: string;
   style?: StyleObject;
+  nodeRef?: NodeRef;
+}
+
+export interface CompositorSurfaceProps {
+  class?: string;
+  className?: string;
+  style?: StyleObject;
+  package: string;
+  focused?: boolean;
   nodeRef?: NodeRef;
 }
 
@@ -241,7 +251,7 @@ function mountChildren(node: NodeMirror, slots: SlotBag): void {
 }
 
 function createPrimitiveNode(
-  tag: "view" | "text" | "image",
+  tag: "view" | "text" | "image" | "surface",
   rawProps: Record<string, unknown>,
   slots: SlotBag,
   opts: { omit?: string[]; onNode?: (node: NodeMirror) => void; extra?: HostProps | (() => HostProps) } = {},
@@ -265,7 +275,7 @@ function createPrimitiveNode(
   return node;
 }
 
-function primitive(tag: "view" | "text" | "image") {
+function primitive(tag: "view" | "text" | "image" | "surface") {
   return definePocketVaporComponent(
     (_props: Record<string, unknown>, { attrs, slots }: VaporCtx) => createPrimitiveNode(tag, attrs, slots),
     NO_FALLTHROUGH,
@@ -276,6 +286,7 @@ export const View = primitive("view");
 export const Text = primitive("text");
 export const Image = primitive("image");
 export const Sprite = primitive("image");
+export const CompositorSurface = primitive("surface");
 
 function resolveActive(active: unknown): boolean {
   const resolved = valueOf(active);
@@ -404,6 +415,69 @@ export const Portal = definePocketVaporComponent((_props: PortalProps, { slots }
   });
   return state.marker;
 }, NO_FALLTHROUGH);
+
+export interface AuxiliarySurfaceProps {
+  children?: VNodeChild;
+}
+
+export const AuxiliarySurface = definePocketVaporComponent(
+  (_props: AuxiliarySurfaceProps, { slots }: { slots: SlotBag }) => {
+    const surface = getAuxiliarySurfaceRoots();
+    const marker = createCommentNode("auxiliary-surface");
+    const host = createElement("view");
+    setProp(
+      host,
+      "style",
+      {
+        width: surface.viewport.width,
+        height: surface.viewport.height,
+        overflow: ENUMS.Overflow.Hidden,
+      },
+      undefined,
+    );
+    insertNode(surface.app, host);
+    const root = createRenderRoot(host);
+    watchEffect(() => root.update(defaultBlock(slots)));
+    onScopeDispose(() => {
+      root.dispose();
+      if (host.parent) detachNode(host.parent, host);
+    });
+    return marker;
+  },
+  NO_FALLTHROUGH,
+);
+
+export const AuxiliaryPortal = definePocketVaporComponent(
+  (_props: AuxiliarySurfaceProps, { slots }: { slots: SlotBag }) => {
+    const surface = getAuxiliarySurfaceRoots();
+    const marker = createCommentNode("auxiliary-portal");
+    const host = createElement("view");
+    setProp(
+      host,
+      "style",
+      {
+        width: surface.viewport.width,
+        height: surface.viewport.height,
+        posType: ENUMS.PosType.Absolute,
+        insetT: 0,
+        insetR: 0,
+        insetB: 0,
+        insetL: 0,
+        hitPass: 1,
+      },
+      undefined,
+    );
+    insertNode(surface.overlay, host);
+    const root = createRenderRoot(host);
+    watchEffect(() => root.update(defaultBlock(slots)));
+    onScopeDispose(() => {
+      root.dispose();
+      if (host.parent) detachNode(host.parent, host);
+    });
+    return marker;
+  },
+  NO_FALLTHROUGH,
+);
 
 export interface ModalProps {
   class?: string;

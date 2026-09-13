@@ -66,6 +66,20 @@ export interface PocketManifestV2 {
     readonly output?: string;
     readonly framework: "solid" | "vue-vapor" | "octane";
     readonly viewport: ManifestViewport;
+    /** Additional UI output intent. Physical geometry remains target-owned. */
+    readonly surfaces?: {
+      readonly auxiliary: {
+        readonly fixed: FixedViewportSpec;
+      };
+    };
+    /**
+     * Companion service names the app's svc adapters speak (the exact
+     * strings it passes to `svcOpen`). Hosts derive their svc allowlist
+     * and adapter wiring from the resolved plan's copy of this list —
+     * never from app-name conventions (issue #295). Absent = the app
+     * runs standalone everywhere; svcOpen answers false by default.
+     */
+    readonly companions?: readonly string[];
   };
 }
 
@@ -182,6 +196,44 @@ export const pocketManifestV2Schema = {
           pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
         },
         framework: { enum: ["solid", "vue-vapor", "octane"] },
+        surfaces: {
+          type: "object",
+          additionalProperties: false,
+          required: ["auxiliary"],
+          properties: {
+            auxiliary: {
+              type: "object",
+              additionalProperties: false,
+              required: ["fixed"],
+              properties: {
+                fixed: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["logical", "presentation"],
+                  properties: {
+                    logical: {
+                      type: "array",
+                      items: { type: "integer", minimum: 1 },
+                      minItems: 2,
+                      maxItems: 2,
+                    },
+                    presentation: { enum: PRESENTATION_MODES },
+                  },
+                },
+              },
+            },
+          },
+        },
+        companions: {
+          type: "array",
+          items: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+          },
+          uniqueItems: true,
+        },
         viewport: {
           anyOf: [
             // Shorthand: a bare fixed viewport (format-2 compatibility).

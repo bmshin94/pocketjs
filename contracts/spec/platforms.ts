@@ -38,6 +38,10 @@ export type Viewport = readonly [width: number, height: number];
 export const TARGET_FORMS = ["takeover", "window", "widget", "kiosk", "embedded"] as const;
 export type TargetForm = (typeof TARGET_FORMS)[number];
 
+/** Package execution role used when role-scoped host APIs are admitted. */
+export const PACKAGE_ROLES = ["application", "systemUI"] as const;
+export type PackageRole = (typeof PACKAGE_ROLES)[number];
+
 /**
  * How an application artifact executes on a device — a semantic FIELD like
  * TargetForm, and the top-level split in admission machinery:
@@ -62,9 +66,19 @@ export type ExecutionClass = (typeof EXECUTION_CLASSES)[number];
 /** The forms whose logical viewport is a runtime variable. */
 export const DYNAMIC_FORMS: readonly TargetForm[] = ["window", "widget"];
 
-export interface DisplayProfile {
+export interface FixedDisplayProfile {
   readonly physicalViewport: Viewport;
   readonly logicalViewports: readonly Viewport[];
+  readonly presentations: readonly PresentationMode[];
+  /**
+   * Target raster samples per logical pixel for baked text, vectors, masks,
+   * and target-selected image variants. This is a rendering contract, not an
+   * API capability or a promise that presentation scale has the same value.
+   */
+  readonly rasterDensity: number;
+}
+
+export interface DisplayProfile extends FixedDisplayProfile {
   /**
    * Present exactly when the target's form is dynamic (window/widget): any
    * logical size within [min, max] is admissible, and the host resizes the
@@ -79,13 +93,13 @@ export interface DisplayProfile {
     readonly max: Viewport;
     readonly acceptsFixed?: boolean;
   };
-  readonly presentations: readonly PresentationMode[];
   /**
-   * Target raster samples per logical pixel for baked text, vectors, masks,
-   * and target-selected image variants. This is a rendering contract, not an
-   * API capability or a promise that presentation scale has the same value.
+   * A simultaneously presented fixed-size UI output owned by the same
+   * AppInstance. Present only when the target advertises display.auxiliary.
+   * Its raster density matches the primary display until packages can carry
+   * per-surface raster asset variants.
    */
-  readonly rasterDensity: number;
+  readonly auxiliary?: FixedDisplayProfile;
 }
 
 export interface TargetProfile<C extends string = string> {
@@ -99,6 +113,10 @@ export interface TargetProfile<C extends string = string> {
   readonly display: DisplayProfile;
   /** Framework APIs implemented and tested by this stock host. */
   readonly capabilities: readonly C[];
+  /** APIs exposed only when a package is resolved for a System-owned role. */
+  readonly roleCapabilities?: {
+    readonly systemUI?: readonly C[];
+  };
 }
 
 export type TargetRegistry<C extends string = string> = Readonly<Record<string, TargetProfile<C>>>;
@@ -114,6 +132,7 @@ export type TargetId<T extends TargetRegistry> = Extract<keyof T, string>;
 
 export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   "input.analog.left",
+  "input.analog.right",
   "input.buttons",
   // Framework-synthesized pointer for targets without a native one: the
   // analog nub steers a screen cursor, hover applies `focus:`, the press
@@ -136,6 +155,14 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // is the fallback spelling on targets without it.
   "input.text",
   "input.touch",
+  // Touch contacts whose logical coordinates and hit facts belong to the
+  // auxiliary UI surface rather than the primary viewport. Requires
+  // display.auxiliary; it does not imply ordinary input.touch.
+  "input.touch.auxiliary",
+  // A System UI can place installed Pocket applications into native
+  // compositor surfaces. This describes the UI API, not the host's internal
+  // scheduling implementation.
+  "ui.compositor-surfaces",
   // Credit-based s16 PCM streaming through the audio module's own namespace
   // (`globalThis.audio`, contracts/spec/audio.ts). Registered ahead of any
   // stock TARGET advertising it: the web dev host and the sim host implement
@@ -144,17 +171,55 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // appends the id to its profile only when its native host ships the module
   // (the ring/thread discipline to copy is hosts/psp/src/audio.rs).
   "audio.pcm",
+  // Bounded whole-response HTTP through `fetch()` and the net module's own
+  // namespace (`globalThis.net`, contracts/spec/net.ts). Transport adapters
+  // remain host-owned; the browser dev host, deterministic sim and reference
+  // core exercise the contract without granting network access to every host.
+  "io.offload",
+  "net.http",
+  // SQLite behind the db module's own namespace (`globalThis.db`,
+  // contracts/spec/db.ts): five synchronous ops, rows as one JSON line per
+  // query() call, per-app storage the host confines. Registered ahead of any
+  // stock TARGET advertising it: the sim host and the engine/crates/pocket-db
+  // reference core implement and test the whole contract, so apps can already
+  // declare the requirement and fail admission where the module is absent. A
+  // device target appends the id to its profile only when its native host
+  // ships the module.
+  "data.sqlite",
+  // A per-app file tree behind the fs module's own namespace
+  // (`globalThis.fs`, contracts/spec/fs.ts): nine synchronous ops, every
+  // path confined to the app's own data root — apps cannot name, let alone
+  // reach, each other's trees. Registered ahead of any stock TARGET
+  // advertising it: the sim host and the engine/crates/pocket-fs reference
+  // core implement and test the whole contract, so apps can already declare
+  // the requirement and fail admission where the module is absent. A device
+  // target appends the id to its profile only when its native host ships
+  // the module.
+  "data.fs",
   // Copy/cut/paste round-trips with the OS clipboard.
   "host.clipboard",
   // The logical viewport is runtime-mutable: the app is told about live
   // window resizes and relayouts (framework resizeViewport). Console
   // targets never provide this — their viewport is a platform constant.
   "display.viewport.live",
+  // One fixed-size auxiliary UI output presented simultaneously with the
+  // primary viewport by the same AppInstance. This is not Pocket System
+  // application-surface composition.
+  "display.auxiliary",
   "text.glyphs.baked",
   // Codepoints outside the baked charset still render: the host extends
   // the font atlases at runtime (system-font rasterization + loadFontAtlas
   // reload). Required by any app that accepts arbitrary text input.
   "text.glyphs.runtime",
+  // Text measurement and shaping come from the host text system: full
+  // Unicode coverage (CJK/emoji/fallback fonts) with proportional metrics
+  // beyond the baked charset, and `measureText` observes the same provider
+  // layout does. A different guarantee than text.glyphs.baked — pixels are
+  // deterministic per host, not byte-exact across hosts — hence a different
+  // id (see the header rule). Apps opt in per plan (`enhances`); a host
+  // grants it by installing a core text measurer before the guest mounts
+  // (docs/BACKENDS.md).
+  "text.layout.native",
 ] as const);
 
 export type PocketCapabilityId = CapabilityId<typeof POCKET_CAPABILITIES>;
@@ -172,6 +237,9 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
   readonly vita: TargetProfile<PocketCapabilityId>;
   readonly pocketbook: TargetProfile<PocketCapabilityId>;
   readonly "macos-widget": TargetProfile<PocketCapabilityId>;
+  readonly "macos-app": TargetProfile<PocketCapabilityId>;
+  readonly "linux-app": TargetProfile<PocketCapabilityId>;
+  readonly "web-app": TargetProfile<PocketCapabilityId>;
 }>({
   psp: {
     hostAbi: 1,
@@ -261,6 +329,89 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "text.glyphs.baked",
       "text.glyphs.runtime",
     ],
+  },
+  // The gpui app frame (hosts/desktop is the stock host): a resizable ordinary
+  // window on Zed's gpui/Metal, painting the DrawList as vector quads and
+  // host-shaped text instead of rasterized atlas cells (docs/BACKENDS.md).
+  // HostAbi 4 adds the independent compositor-surface op. An app frame, not a
+  // widget shell, so fixed-viewport apps run size-locked
+  // (acceptsFixed) with their baked glyph pipeline intact; apps that enhance
+  // text.layout.native get host text measurement and shaping instead.
+  // The common profile lists ONLY what the host implements for every app:
+  // the keyboard button map and the __pocketResizeViewport live-viewport hook.
+  // Pointer, hardware text, IME and clipboard reach the note through its
+  // companion svc adapter (an app protocol, not a host capability — see
+  // tools/macos.ts), so per the header rule they are not registered here;
+  // a host-generic pointer/text feed needs framework surface beyond the
+  // 9-bit touch packing and is tracked as follow-up work.
+  "macos-app": {
+    hostAbi: 4,
+    platform: "macos",
+    form: "window",
+    display: {
+      physicalViewport: [1440, 960],
+      logicalViewports: [[720, 480]],
+      dynamicViewport: { min: [240, 180], max: [4096, 4096], acceptsFixed: true },
+      presentations: ["native"],
+      rasterDensity: 2,
+    },
+    capabilities: [
+      "input.buttons",
+      "display.viewport.live",
+      "text.glyphs.baked",
+      "text.layout.native",
+    ],
+    roleCapabilities: {
+      systemUI: ["ui.compositor-surfaces"],
+    },
+  },
+  // The same gpui AppSupervisor/compositor host on Linux. Linux defaults to
+  // one raster sample per logical pixel while keeping native text layout and
+  // the same dynamic/fixed application admission contract as macOS.
+  "linux-app": {
+    hostAbi: 4,
+    platform: "linux",
+    form: "window",
+    display: {
+      physicalViewport: [1280, 800],
+      logicalViewports: [[800, 600]],
+      dynamicViewport: { min: [240, 180], max: [4096, 4096], acceptsFixed: true },
+      presentations: ["native"],
+      rasterDensity: 1,
+    },
+    capabilities: [
+      "input.buttons",
+      "display.viewport.live",
+      "text.glyphs.baked",
+      "text.layout.native",
+    ],
+    roleCapabilities: {
+      systemUI: ["ui.compositor-surfaces"],
+    },
+  },
+  // Browser Pocket System host: one iframe JavaScript Realm and one wasm Ui
+  // per package, scheduled and composited by hosts/web/system-engine.js. The
+  // shell viewport follows the browser canvas; acceptsFixed admits installed
+  // console-shaped applications inside compositor surfaces.
+  "web-app": {
+    hostAbi: 4,
+    platform: "web",
+    form: "window",
+    display: {
+      physicalViewport: [800, 600],
+      logicalViewports: [[800, 600]],
+      dynamicViewport: { min: [320, 240], max: [4096, 4096], acceptsFixed: true },
+      presentations: ["native"],
+      rasterDensity: 1,
+    },
+    capabilities: [
+      "input.buttons",
+      "display.viewport.live",
+      "text.glyphs.baked",
+    ],
+    roleCapabilities: {
+      systemUI: ["ui.compositor-surfaces"],
+    },
   },
 });
 

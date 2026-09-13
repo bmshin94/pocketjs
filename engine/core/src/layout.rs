@@ -42,8 +42,9 @@ impl MeasureCtx {
         slot: u8,
         tracking: f32,
         line_height: f32,
+        native: bool,
     ) -> MeasureCtx {
-        let size = fonts.measure_run(&text, slot, tracking, line_height);
+        let size = fonts.measure_run_provider(native, &text, slot, tracking, line_height);
         MeasureCtx { text, slot, tracking, line_height, size }
     }
 }
@@ -237,23 +238,38 @@ pub fn to_taffy(r: &Resolved) -> taffy::Style {
 }
 
 /// Build the taffy node for `slot`'s subtree. Returns None for excluded
-/// nodes (empty text runs).
-fn build(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, taffy: &mut TaffyTree<MeasureCtx>, slot: u32) -> Option<taffy::NodeId> {
+/// nodes (empty text runs). `in_transform` accumulates declared transforms
+/// down the tree: text under one keeps the baked measurement pair, and the
+/// choice is RECORDED on the node (`Node::text_native`) so paint follows
+/// the provider that sized the box — never a mid-frame re-decision.
+fn build(
+    tree: &mut Tree,
+    styles: &StyleTable,
+    fonts: &Fonts,
+    taffy: &mut TaffyTree<MeasureCtx>,
+    slot: u32,
+    in_transform: bool,
+) -> Option<taffy::NodeId> {
     let resolved = style::resolve(&tree.slots[slot as usize], styles, true);
+    let in_transform = in_transform || resolved.declares_transform();
     let node_type = tree.slots[slot as usize].node_type;
     if node_type == spec::NodeType::Text as u8 {
         let mut run = String::new();
         tree.collect_run(slot, &mut run);
         if run.is_empty() {
             tree.slots[slot as usize].taffy = None;
+            tree.slots[slot as usize].text_native = false;
             return None; // empty text nodes never consume gap/flex space [R]
         }
+        let native = fonts.native_active() && resolved.tracking == 0.0 && !in_transform;
+        tree.slots[slot as usize].text_native = native;
         let ctx = MeasureCtx::shaped(
             fonts,
             run,
             resolved.font_slot as u8,
             resolved.tracking,
             resolved.line_height,
+            native,
         );
         let nid = taffy.new_leaf_with_context(to_taffy(&resolved), ctx).ok()?;
         tree.slots[slot as usize].taffy = Some(nid);
@@ -263,7 +279,7 @@ fn build(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, taffy: &mut TaffyT
     let mut kids: Vec<taffy::NodeId> = Vec::with_capacity(children.len());
     for c in children {
         if let Some(cs) = tree.resolve(c) {
-            if let Some(k) = build(tree, styles, fonts, taffy, cs) {
+            if let Some(k) = build(tree, styles, fonts, taffy, cs, in_transform) {
                 kids.push(k);
             }
         }
@@ -275,11 +291,11 @@ fn build(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, taffy: &mut TaffyT
 
 /// Copy rounded layout output back into the node tree (flat pass — layouts
 /// are parent-relative, so order does not matter; no per-node allocations).
-fn readback(tree: &mut Tree, taffy: &TaffyTree<MeasureCtx>) {
-    for node in tree.slots.iter_mut() {
-        if !node.alive {
-            continue;
-        }
+fn readback(tree: &mut Tree, taffy: &TaffyTree<MeasureCtx>, root_id: i32) {
+    let mut slots = Vec::new();
+    tree.collect_subtree(root_id, &mut slots);
+    for slot in slots {
+        let node = &mut tree.slots[slot as usize];
         match node.taffy {
             Some(nid) => {
                 if let Ok(l) = taffy.layout(nid) {
@@ -296,7 +312,13 @@ fn readback(tree: &mut Tree, taffy: &TaffyTree<MeasureCtx>) {
     }
 }
 
-fn compute(tree: &mut Tree, _fonts: &Fonts, eng: &mut LayoutEngine, root_nid: taffy::NodeId) {
+fn compute(
+    tree: &mut Tree,
+    _fonts: &Fonts,
+    eng: &mut LayoutEngine,
+    root_id: i32,
+    root_nid: taffy::NodeId,
+) {
     let _ = eng.taffy.compute_layout_with_measure(
         root_nid,
         Size {
@@ -313,7 +335,7 @@ fn compute(tree: &mut Tree, _fonts: &Fonts, eng: &mut LayoutEngine, root_nid: ta
             }
         },
     );
-    readback(tree, &eng.taffy);
+    readback(tree, &eng.taffy, root_id);
 }
 
 /// Relayout. STYLE-only dirt restyles the dirty nodes in the LIVE taffy tree
@@ -321,6 +343,19 @@ fn compute(tree: &mut Tree, _fonts: &Fonts, eng: &mut LayoutEngine, root_nid: ta
 /// layout-prop keyframe animations 60 Hz on the PSP); STRUCTURE dirt rebuilds
 /// the tree from scratch.
 pub fn relayout(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, eng: &mut LayoutEngine) {
+    relayout_root(tree, styles, fonts, eng, spec::ROOT_ID);
+}
+
+/// Relayout one independent output root. Auxiliary roots share the arena and
+/// resource tables with the primary tree, but keep separate taffy state and
+/// viewport bounds.
+pub fn relayout_root(
+    tree: &mut Tree,
+    styles: &StyleTable,
+    fonts: &Fonts,
+    eng: &mut LayoutEngine,
+    root_id: i32,
+) {
     if !eng.dirty && eng.built {
         if eng.style_dirty.is_empty() {
             return;
@@ -330,6 +365,10 @@ pub fn relayout(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, eng: &mut L
         let dirty = core::mem::take(&mut eng.style_dirty);
         for &slot in &dirty {
             if !tree.slots[slot as usize].alive {
+                continue;
+            }
+            let node_id = tree.slots[slot as usize].id(slot);
+            if !tree.is_in_subtree(root_id, node_id) {
                 continue;
             }
             let Some(nid) = tree.slots[slot as usize].taffy else {
@@ -342,30 +381,44 @@ pub fn relayout(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, eng: &mut L
             if tree.slots[slot as usize].node_type == spec::NodeType::Text as u8 {
                 let mut run = String::new();
                 tree.collect_run(slot, &mut run);
+                // A restyle keeps the RECORDED provider (it has no ancestor
+                // context to re-derive the transform gate); only a node-local
+                // tracking change can flip the record — to the baked pair,
+                // which handles tracking (native shaping does not).
+                let native = tree.slots[slot as usize].text_native && resolved.tracking == 0.0;
+                tree.slots[slot as usize].text_native = native;
                 let ctx = MeasureCtx::shaped(
                     fonts,
                     run,
                     resolved.font_slot as u8,
                     resolved.tracking,
                     resolved.line_height,
+                    native,
                 );
                 let _ = eng.taffy.set_node_context(nid, Some(ctx));
             }
             let _ = eng.taffy.set_style(nid, to_taffy(&resolved));
         }
         if let Some(root_nid) = eng.root {
-            compute(tree, fonts, eng, root_nid);
+            compute(tree, fonts, eng, root_id, root_nid);
             return;
         }
         eng.dirty = true; // no built root (should not happen) — full rebuild
     }
     eng.taffy.clear();
     eng.style_dirty.clear();
-    for n in tree.slots.iter_mut() {
-        n.taffy = None;
+    let mut surface_slots = Vec::new();
+    tree.collect_subtree(root_id, &mut surface_slots);
+    for &slot in &surface_slots {
+        tree.slots[slot as usize].taffy = None;
     }
-    let root_slot = crate::tree::split_id(spec::ROOT_ID).1;
-    let Some(root_nid) = build(tree, styles, fonts, &mut eng.taffy, root_slot) else {
+    let Some(root_slot) = tree.resolve(root_id) else {
+        eng.dirty = false;
+        eng.built = false;
+        eng.root = None;
+        return;
+    };
+    let Some(root_nid) = build(tree, styles, fonts, &mut eng.taffy, root_slot, false) else {
         eng.dirty = false;
         eng.built = false;
         eng.root = None;
@@ -374,7 +427,7 @@ pub fn relayout(tree: &mut Tree, styles: &StyleTable, fonts: &Fonts, eng: &mut L
     eng.root = Some(root_nid);
     eng.built = true;
     eng.dirty = false;
-    compute(tree, fonts, eng, root_nid);
+    compute(tree, fonts, eng, root_id, root_nid);
 }
 
 /// Smoke helper proving the pinned taffy feature set

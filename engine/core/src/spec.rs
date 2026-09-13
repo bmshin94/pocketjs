@@ -35,7 +35,7 @@ pub const TEX_MAX_DIM: u32 = 512;
 pub const TEX_SLOT_BITS: u32 = 20;
 pub const TEX_SLOT_MASK: u32 = 0xfffff;
 /// Max baked font-atlas slots.
-pub const MAX_FONT_SLOTS: usize = 16;
+pub const MAX_FONT_SLOTS: usize = 24;
 /// Transition mask value meaning "every animatable prop".
 pub const TRANSITION_MASK_ALL: u32 = 0xffffffff;
 /// Core tick timestep: exactly 1/60 s (fixed — enables byte-exact goldens).
@@ -48,6 +48,7 @@ pub enum NodeType {
     View = 0,
     Text = 1,
     Image = 2,
+    Surface = 3,
 }
 
 /// UI op codes (the engine/wasm/FFI ABI identity of each `ui.*` op; 0 reserved).
@@ -95,6 +96,10 @@ pub mod op {
     pub const APP_LAUNCH: u8 = 40;
     pub const APP_SHOT: u8 = 41;
     pub const HIT_TEST_BOUNDS: u8 = 42;
+    pub const WRAP_TEXT: u8 = 43;
+    pub const SET_COMPOSITOR_SURFACE: u8 = 44;
+    pub const HIT_TEST_AUXILIARY: u8 = 45;
+    pub const HIT_TEST_BOUNDS_AUXILIARY: u8 = 46;
 }
 
 /// Property ids (u8, stable, append-only). Groups:
@@ -145,6 +150,8 @@ pub mod prop {
     pub const BEVEL_INNER_LIGHT: u8 = 79;
     pub const BEVEL_INNER_DARK: u8 = 80;
     pub const BEVEL_WIDTH: u8 = 81;
+    pub const GRAD_VIA: u8 = 82;
+    pub const GRAD_VIA_POS: u8 = 83;
     pub const TEXT_COLOR: u8 = 96;
     pub const FONT_SLOT: u8 = 97;
     pub const TEXT_ALIGN: u8 = 98;
@@ -181,7 +188,7 @@ pub const PROP_VALUE_KIND: [u8; 256] = [
     0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0x01, 0x01, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x01,
-    0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x01, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0x01, 0x02, 0x02, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
@@ -420,7 +427,8 @@ pub mod font_atlas {
 
 /// DrawList op codes (core -> backend Vec<u32> words; layout in spec.ts).
 /// Word counts incl. header: RECT 4, GRAD_RECT 6, GLYPH_RUN 3+2n,
-/// TEX_QUAD 9, SCISSOR 3, SCISSOR_POP 1, TRI 7.
+/// TEX_QUAD 9, SCISSOR 3, SCISSOR_POP 1, TRI 7, TEX_TRI 12,
+/// TEXT_RUN 8+ceil(bytes/4), SURFACE_QUAD 9.
 pub mod draw_op {
     pub const RECT: u32 = 1;
     pub const GRAD_RECT: u32 = 2;
@@ -430,6 +438,8 @@ pub mod draw_op {
     pub const SCISSOR_POP: u32 = 6;
     pub const TRI: u32 = 7;
     pub const TEX_TRI: u32 = 8;
+    pub const TEXT_RUN: u32 = 9;
+    pub const SURFACE_QUAD: u32 = 10;
 }
 
 /// .pak container constants (byte-compatible with dreamcart's format;
@@ -463,6 +473,8 @@ pub mod btn {
     pub const LEFT: u32 = 0x0080;
     pub const LTRIGGER: u32 = 0x0100;
     pub const RTRIGGER: u32 = 0x0200;
+    pub const ZL: u32 = 0x0400;
+    pub const ZR: u32 = 0x0800;
     pub const TRIANGLE: u32 = 0x1000;
     pub const CIRCLE: u32 = 0x2000;
     pub const CROSS: u32 = 0x4000;
@@ -497,4 +509,88 @@ pub mod audio {
     pub const EVENT_CREDIT: &str = "credit";
     pub const EVENT_UNDERRUN: &str = "underrun";
     pub const EVENT_ENDED: &str = "ended";
+}
+
+/// DB module boundary (contracts/spec/db.ts — `globalThis.db`).
+/// SQLite behind five synchronous ops; rows cross as one JSON line per
+/// query() call. The module owns no clock and emits no events.
+pub mod db {
+    pub const OP_OPEN: u8 = 1;
+    pub const OP_CLOSE: u8 = 2;
+    pub const OP_EXEC: u8 = 3;
+    pub const OP_QUERY: u8 = 4;
+    pub const OP_LAST_ERROR: u8 = 5;
+    /// The in-memory database name (private to the handle).
+    pub const MEMORY: &str = ":memory:";
+    /// Marker key for a BLOB value inside a row or a parameter list.
+    pub const BLOB_KEY: &str = "$b";
+    /// Largest integer magnitude that crosses the boundary losslessly.
+    pub const MAX_SAFE_INTEGER: i64 = 9007199254740991;
+    pub const MAX_DATABASES: usize = 4;
+    /// Result-row ceiling per query() call (exceeding it fails the op).
+    pub const MAX_RESULT_ROWS: usize = 4096;
+}
+
+/// FS module boundary (contracts/spec/fs.ts — `globalThis.fs`).
+/// A per-app file tree behind nine synchronous ops; every path resolves
+/// under the app's own data root. No clock, no events, no mtime.
+pub mod fs {
+    pub const OP_READ: u8 = 1;
+    pub const OP_WRITE: u8 = 2;
+    pub const OP_REMOVE: u8 = 3;
+    pub const OP_LIST: u8 = 4;
+    pub const OP_STAT: u8 = 5;
+    pub const OP_MKDIR: u8 = 6;
+    pub const OP_RENAME: u8 = 7;
+    pub const OP_USAGE: u8 = 8;
+    pub const OP_LAST_ERROR: u8 = 9;
+    /// write() modes.
+    pub const WRITE_TRUNCATE: u32 = 0;
+    pub const WRITE_APPEND: u32 = 1;
+    /// Marker key for a bytes payload (db's blob spelling).
+    pub const BLOB_KEY: &str = "$b";
+    /// Maximum UTF-8 bytes in one path segment.
+    pub const MAX_SEGMENT_BYTES: usize = 64;
+    /// Maximum segments in a path.
+    pub const MAX_DEPTH: usize = 8;
+    /// Maximum total path length in bytes.
+    pub const MAX_PATH_BYTES: usize = 160;
+    /// Payload ceiling per read()/write() call, in bytes.
+    pub const MAX_IO_BYTES: usize = 65536;
+    /// Entries per list() call (paged via offset + eof).
+    pub const MAX_DIR_ENTRIES: usize = 256;
+}
+
+/// NET module boundary (contracts/spec/net.ts — `globalThis.net`).
+/// Bounded whole-response HTTP; completions batch to tick boundaries.
+pub mod net {
+    pub const OP_START: u8 = 1;
+    pub const OP_TAKE: u8 = 2;
+    pub const OP_CANCEL: u8 = 3;
+    pub const OP_POLL: u8 = 4;
+    pub const OP_LAST_ERROR: u8 = 5;
+    pub const MAX_INFLIGHT: usize = 2;
+    pub const MAX_REQUEST_BYTES: usize = 65536;
+    pub const DEFAULT_RESPONSE_BYTES: usize = 131072;
+    pub const MAX_RESPONSE_BYTES: usize = 262144;
+    pub const MAX_HEADERS: usize = 32;
+    pub const MAX_HEADER_BYTES: usize = 8192;
+    pub const DEFAULT_TIMEOUT_MS: u32 = 30000;
+    pub const MAX_TIMEOUT_MS: u32 = 120000;
+    pub const MAX_REDIRECTS: usize = 3;
+    pub const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    pub const EVENT_DONE: &str = "done";
+    pub const EVENT_ERROR: &str = "error";
+    pub const ERROR_UNAVAILABLE: &str = "unavailable";
+    pub const ERROR_INVALID_REQUEST: &str = "invalid_request";
+    pub const ERROR_BUSY: &str = "busy";
+    pub const ERROR_DNS: &str = "dns";
+    pub const ERROR_CONNECT: &str = "connect";
+    pub const ERROR_TLS: &str = "tls";
+    pub const ERROR_TIMEOUT: &str = "timeout";
+    pub const ERROR_REDIRECT: &str = "redirect";
+    pub const ERROR_RESPONSE_TOO_LARGE: &str = "response_too_large";
+    pub const ERROR_PROTOCOL: &str = "protocol";
+    pub const ERROR_CANCELLED: &str = "cancelled";
+    pub const ERROR_OTHER: &str = "other";
 }

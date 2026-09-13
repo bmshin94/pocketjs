@@ -3,6 +3,269 @@
 Engine and site milestones, newest first. Versions track the
 `@pocketjs/framework` npm package.
 
+## 0.11.0 — August 30, 2026
+
+**Two more device families run PocketJS, a second backend class paints through gpui and measures text on the host, and a paired Nintendo 3DS takes new guests over Wi-Fi.**
+0.11.0 adds the Nintendo 3DS and the BlackBerry Classic to the host set, a
+backend class that hands text measurement to the platform instead of a baked
+atlas, and a System that supervises several guests behind one compositor on
+macOS, Linux and the browser. Both new device profiles remain private
+development targets: each records an exact hardware and firmware tuple, and
+neither advertises a production capability from a build alone.
+
+- **The Nintendo 3DS runs a QuickJS guest on both screens.** The split follows
+  `hosts/iphone2g` rather than `hosts/psp`: citro3d is mostly `static inline`,
+  so C owns the GPU while a `no_std` Rust staticlib built for the built-in
+  `armv6k-nintendo-3ds` target owns the core and exports the DrawList. The top
+  screen is a fixed 400×240 viewport and the touch screen a 320×240 auxiliary
+  surface; touch arrives on the auxiliary surface alone. `3ds-dev` is host ABI
+  8. The demo splits one classic iPhone Contacts app across the two: a
+  10,000-row virtual list, its section index and its scrubber below, and the
+  detail card the phone had to push a navigation level to reach above. Goldens
+  run the same PICA200 code path under Azahar and match hardware.
+- **Pocket Runtime accepts a new guest over Wi-Fi.** `bun run 3ds:dev pair`
+  installs a 32-byte key once through ftpd; after that a paired TCP connection
+  carries `.pocket` updates and dual-screen RGB8 captures as bounded binary
+  frames that never enter QuickJS, and `bun run 3ds:dev dev` bridges the
+  existing DevTools protocol to the panel. Updates reuse the Runtime's target
+  and ABI admission, immutable package storage, retired-frame acceptance and
+  rollback path. `L+R+SELECT` opens a Runtime-owned menu on the bottom screen
+  with the device's IP, pairing and connection state, generation and package
+  hash. The pairing key authenticates but does not encrypt the LAN connection,
+  and the channel updates guests only: a new `.3dsx` or CIA still requires
+  deployment and a restart.
+- **The BlackBerry Classic runs two hosts over one shared contract.**
+  `hosts/blackberry-classic-qnx` is a BB10 Core Native host (libscreen, BPS,
+  EGL/GLES2) built and packaged as an unsigned development BAR inside the
+  digest-pinned BBNDK image and installed on a rooted Classic;
+  `hosts/blackberry-classic-android` is an Android Runtime (API 18) host whose
+  v1-signed APK drives the same QuickJS bridge and Rust core through a JNI
+  `armeabi-v7a` library. Both register at 720×720 physical, 360×360 logical at
+  density 2, host ABI 9. First device run recorded on an SQC100-4 at
+  10.3.3.3216; the [port write-up](/blog/blackberry-classic/) walks the QNX
+  route onto the square screen.
+- **A second backend class paints through gpui and measures text on the
+  host.** The portable family (wgpu, software raster, PPA, GLES2) keeps
+  executing the DrawList against compile-time baked font atlases.
+  `engine/backends/gpui` paints through Zed's gpui/Metal renderer instead, and
+  `text::MeasureFn` plus `DRAW_OP.TEXT_RUN` route measurement and shaping to
+  CoreText when an app opts in — a `styleHash` word keeps identical word
+  streams pixel-identical, so demand-render hashes stay truthful. The
+  `macos-app` target ships with it, together with a `wrapText` host op and a
+  Notepad whose word wrap, hit-testing, caret movement, selection and
+  undo/redo all read one visual-segment layout, so reflow on resize falls out
+  of the reactive width.
+- **A System supervises several guests behind one compositor.** Pocket System
+  resolution, role-scoped compositor surfaces and isolated `AppInstance`
+  supervision arrive with a product-neutral macOS compositor host, and Linux
+  and browser System hosts run the same resolved plan.
+- **The manifest and the resolved plan carry companion adapters and viewport
+  policy.** `app.companions` names the exact `svcOpen` service names an app's
+  adapters speak, and the plan carries `companions` and `viewport.policy`, so
+  a host derives every boot flag from one artifact instead of re-reading the
+  raw manifest and matching on the application's name.
+- **The gesture layer is framework-neutral and recognizes pinch.** The
+  recognizer machinery and the kinetic scroller move into `gesture-core.ts`
+  and `kinetics-core.ts` behind per-framework shims, so the Vue Vapor entry
+  runs the same touch pipeline as Solid: contacts latch with their
+  host-resolved hit facts, the gesture pump runs before app frame hooks, and
+  the tap-to-press recognizer installs at mount. A two-contact pinch
+  recognizer measures span on the locked axis and claims both contacts when
+  the span change beats `pinchSlop` and the centroid travel. The legacy UIKit
+  runtime replaces its single-contact globals with an eight-slot touch table.
+  Pocket Clear on the iPod touch 4 is the demo the layer was built against.
+- **`via-*` adds a middle gradient stop, and vertical gradients point the
+  right way on the 3DS.** The core draws a three-stop gradient as two ordinary
+  two-stop boxes, so every backend still sees `GRAD_RECT` and clipping stays
+  where it was. `hosts/3ds/src/gfx.c` copies the spec's `GradDir` ordinals
+  into C by hand and had `ToTop` and `ToBottom` swapped, which inverted every
+  vertical gradient on the one backend that does not read the generated Rust
+  enum. The gpui raster fallback renders the full viewport and composites
+  transparently, and the compiler's path handling is portable on Windows
+  again.
+- **PocketJS 98 and a desktop benchmark measure the gpui host.** `apps/desk98`
+  is a Windows 98 desktop as one guest — draggable, resizable, z-ordered
+  windows, taskbar, Start menu, Notepad, Minesweeper and the classic
+  shortcuts — with window moves riding paint-only transform props so a drag
+  never relayouts and the idle desktop holds the demand-render governor at a
+  few frames a second. `tools/bench-desktop.ts` measures byte-identical web
+  editors shelled by Tauri v2 and Electron against the Pocket note on the same
+  host; the numbers and their fairness caveats ship with the report.
+- **The site is one design system across a nine-chapter homepage.** Shared
+  tokens, chrome and base stylesheets replace the per-page CSS, the landing
+  carries compatibility receipts, and an icon family covers every surface from
+  the favicon to the Safari bookmark and the iOS home screen. A new post
+  derives the [agent-native runtime for embedded
+  systems](/blog/agent-native-runtime-embedded-systems/).
+
+## 0.10.1 — August 16, 2026
+
+**Three more physical phones run PocketJS, Pocket Vapor compiles a smaller reactive graph, and Pocket3D gains a deterministic systemic world.**
+0.10.1 carries the connected-device work completed after 0.10.0 together with
+the compiler, renderer and tooling fixes those devices exposed. The new phone
+profiles remain private development targets: each one records an exact
+hardware and firmware tuple, and none advertises a production capability from
+a build or upload alone.
+
+- **Windows CE runs a real Solid guest on the Meizu M8.** One ARM executable
+  embeds QuickJS, the app and its assets, and the Rust software renderer; the
+  native host copies a 480×720 BGRA framebuffer to the LCD through GDI without
+  stretching. The host turns WinCE messages into wide touch coordinates,
+  closes cleanly on Home or Escape, registers a build-qualified MiniOneShell
+  icon, and deploys over the phone's ActiveSync serial function through PPP
+  and RAPI. Status requires advancing guest frames, successful GDI composites
+  and matching logical and physical viewports; acceptance additionally
+  requires a completed touch and changed application action. The
+  [field report](/blog/pocketjs-on-windows-ce/) follows the port from the first
+  clipped 320×480 frame to the native, readable result.
+- **The sixth-generation iPod touch has a transactional native host.** The
+  tested `iPod7,1` on iOS 12.5.8 runs an arm64 UIKit application at a 320×568
+  logical viewport and density 2. Each deploy re-identifies the device, opens
+  a fresh UDID-scoped USB tunnel, verifies the staged bundle byte by byte, and
+  keeps a rollback copy until SpringBoard registration succeeds. Wide touch
+  words preserve the bottom of the 568-point surface, while the device receipt
+  proves a live process, advancing frames, completed release and `hero_tap`.
+- **The iPhone 4S runs the retained UI through OpenGL ES 1.1 at Retina
+  density.** The private iOS 6.1.3 host builds an ARMv7 bundle against locally
+  derived, hash-pinned linker stubs and requires the physical runtime to report
+  a 640×960 GLES1 drawable for its 320×480 logical viewport. Transaction leases,
+  staged file hashes, signature checks and rollback keep a failed install from
+  replacing the working application; the captured device frame comes from the
+  actual Retina renderbuffer.
+- **The modern iOS shell's 120 Hz path is complete.** Its NativeScript plugin
+  pin moves to `@nativescript/pocketjs` 0.2.1, whose native bridge publishes the
+  requested tick rate before guest evaluation. This closes 0.10.0's known
+  limitation: a 120 Hz bundle and host now establish the same mount invariant
+  instead of refusing the unpublished 0.2.0 bridge.
+- **Pocket Vapor removes work that static analysis proves unreachable.** A
+  sparse conditional constant-propagation pass folds constant ref reads,
+  selects decidable branches, and removes their dead dependencies and ROM.
+  Frame-local view and bounded-string temporaries now share statically colored
+  overlay slots when their generated owners cannot be live together, reducing
+  permanent RAM and stack pressure on the NES and Game Boy. Linux parity runs
+  can supply `MGBA_PREFIX` and `CC65_LIB` without changing the macOS defaults.
+- **`pocket3d-world` is a renderer-independent fixed-step simulation.** Stable
+  entity IDs, seeded randomness and ordered phases cover sphere and capsule
+  bodies, attachments, structural damage, retained water, heat, fuel and
+  combustion. Inputs, initial state and configuration replay to a stable state
+  hash; shared collision and reaction laws are tested as general invariants,
+  while concrete material recipes remain application-owned. Pocket3D model
+  sockets and the optional stylized scene path present that state without
+  moving simulation policy into the renderer.
+- **Font and desktop-host regressions are closed.** The font baker now closes
+  implicitly closed CFF contours before scanline filling, retaining their final
+  edge, and the Note and widget launchers resolve their Cargo outputs from the
+  current `engine/` workspace rather than the retired nested path.
+- **Release automation runs on the current Node 24-backed GitHub Actions.** The
+  checkout, cache and setup-node upgrades preserve the existing OIDC trusted
+  publishing, build gates and deployment behavior.
+
+## 0.10.0 — August 15, 2026
+
+**Apps reach the network, a database and their own files, and a realm declares the rate its virtual time runs at.**
+0.10.0 adds three modules — `net`, `db` and `fs` — each behind its own
+append-only op spec, a deterministic sim host and a reference Rust core, and
+turns the core's fixed 1/60 s step into a per-realm constant chosen before the
+first tick. Every default remains 60 and the 60 Hz path is the identical
+expression throughout, so existing bundles, tapes and frame-hash goldens are
+byte-for-byte unchanged.
+
+- **`net` — bounded whole-response HTTP.** `fetch()` and `globalThis.net` over
+  five ops (`start`, `take`, `cancel`, `poll`, `lastError`), with the bounds in
+  the spec rather than in each host: **2 in flight**, **64 KB** of request,
+  **128 KB** of response by default and **256 KB** at most, 32 headers. The
+  transport never calls into QuickJS — completions are staged to tick
+  boundaries and drained one batch per tick — so a network answer cannot land
+  in the middle of a frame. Transport adapters stay host-owned; the browser dev
+  host, the sim and `engine/crates/pocket-net` exercise the contract without
+  granting network access to every host.
+- **`db` — SQLite behind five synchronous ops.** `open`, `close`, `exec`,
+  `query`, `lastError`, with rows arriving as one JSON line per `query()` call
+  rather than a cursor: at most **4 databases** per app, **4096 rows** per
+  result, names matched against a fixed pattern, and storage the host confines
+  to the app. `:memory:` is spelled the same as SQLite spells it.
+- **`fs` — a per-app file tree behind nine ops.** `read`, `write`, `remove`,
+  `list`, `stat`, `mkdir`, `rename`, `usage`, `lastError`, plus a
+  `readFileSync`/`writeFileSync` surface for code that expects one. **Every
+  path is confined to the app's own data root** — apps cannot name, let alone
+  reach, each other's trees — and the shape of a path is bounded too: **160
+  bytes**, **8 levels**, 64 bytes per segment.
+- **No stock target advertises the three capabilities yet.** `net.http`,
+  `data.sqlite` and `data.fs` are registered ahead of any console host shipping
+  them, exactly as `audio.pcm` was: the sim host and the reference cores
+  implement the whole contract, so an app can declare the requirement today,
+  run against the sim (and, for `net`, the browser dev host), and fail
+  admission cleanly where the module is absent. A device target appends the id
+  to its profile when its native host ships the module — not before.
+- **A realm declares its tick rate before its first tick.** `Ui::set_tick_rate`
+  threads `dt` through the spring integrators and every ms-to-frame conversion,
+  keeping exact integer hz alongside it so frame counts stay integers;
+  `tools/build.ts --hz` bakes the same rate into the bundle, and clock,
+  kinetics, input, deepzoom and the styles.bin ANIM TABLE all derive their
+  per-tick constants from it. The rate is **fixed for the whole run** — a
+  realm's frame content stays a pure function of its frame index, which is what
+  keeps goldens byte-exact.
+- **A bundle refuses a host that drives another rate.** The host publishes its
+  rate as `ui.__tickHz` and the bundle checks it where it already checks target
+  and host ABI. **An absent `__tickHz` means 60**, so every host that predates
+  per-realm rates keeps mounting every bundle built the ordinary way. Without
+  this a 120-baked bundle mounted on a 60-stepped core and ran at half speed
+  silently; it now fails at mount with both rates named.
+- **Modern iOS runs guests, as a transitional target.** `pocket ios
+  doctor|build|stage|play` builds against an `ios-dev` plan and launches inside
+  a NativeScript shell on an arm64 simulator, over the `pocket-apple` crate:
+  one guest realm, one UI surface, and the software rasterizer driven
+  incrementally through a damage tracker behind a small C ABI, with a UIKit
+  view compositing only what changed. The profile stays **out of
+  `POCKET_TARGETS`** until it has device-level acceptance, following the same
+  convention the iPhone 2G target used. **Known limitation:** the 120 Hz path
+  needs `@nativescript/pocketjs` 0.2.1, which is not published yet — against
+  the current 0.2.0 plugin a 120 Hz bundle refuses to mount (loudly, by the
+  rule above) while 60 Hz is unaffected.
+- **Hosts choose the guest allocator**, so an embedder with its own arena no
+  longer has to accept the default one.
+- **Site**: the landing page leads with a machine collage and per-audience
+  `/for/` pages, the in-browser playground reuses the landing PSP model, and
+  every playground demo is validated and restored on build.
+
+## 0.9.3 — August 8, 2026
+
+**The PSP arena no longer strands the memory a QuickJS boot needs.**
+A guest whose boot parses a megabyte of JSON could exhaust the heap while
+megabytes sat free, because the arena's power-of-two size classes never hand a
+block to a different class. 0.9.3 closes that, and
+[Pocket Voxel](https://github.com/pocket-stack/pocket-voxel) boots on a real
+PSP-2000 at the default arena size again.
+
+- **`realloc` keeps the pointer when the new size stays inside the block's
+  class.** The arena rounds every request up to a power of two, so a grow that
+  stays in class already owns those bytes. QuickJS grows its string and array
+  builders geometrically, and the previous allocator answered every one of those
+  grows with an allocate, a copy, and a free that put the old block into a class
+  nothing asked for again. A boot parsing 1.15 MB of game data stranded
+  megabytes this way.
+- **`arena::alloc` splits a larger free block when the bump is spent**, halving
+  down to the class it needs. It runs last on purpose: a heap with room behaves
+  exactly as it did in 0.9.2, and large blocks stay whole for the callers that
+  want them.
+- **A null exception object is an out-of-memory signature.** `[PocketJS js
+  error] null` followed by `JS_Eval threw` means QuickJS could not allocate an
+  `Error` to throw, so the guest source is not the suspect. The same halt line
+  covers every eval failure, which is what made this one read as a code bug for
+  a day.
+- **`globalThis.audio` mounts without the `ui` surface.** `register_audio` is
+  split out of `register`, so a host that owns its own surface can still offer
+  the `audio.pcm` capability. The credit mirror also decays with the hardware
+  stream: `poll()` never subtracted what `write()` accepted, so a ring the mixer
+  drained completely between two polls sent no credit and the guest went
+  permanently silent after a couple of seconds.
+
+Measured on the hardware that found it. The same guest bundle peaks at
+**12.3 MB** under desktop QuickJS and needed more than **15.5 MB** on the device
+before this release; it now boots inside the **14.3 MB** an XMB launch leaves
+after a 32 MB pak, with the emulator journey green at 11 of 11 marks and
+frame-hash goldens byte-identical at both quality rungs.
+
 ## 0.9.2 — August 6, 2026
 
 **A locked 60 fps on a 2007 iPhone, because the composite was the only stage that was never damage-limited.**
@@ -20,7 +283,7 @@ and exposes the damage statistics that made the diagnosis possible. The
   handed. The composite costs **0.26 ms**, and the frame **7.63 ms** of a
   16.67 ms budget. No preservation guarantee is relied on: when UIKit discards
   the backing store it passes full bounds and the full frame is drawn.
-- **Damage is observable.** `engine/symbian` was discarding the `DamagePlan` the
+- **Damage is observable.** `engine/ui-cabi` was discarding the `DamagePlan` the
   incremental rasterizer returns. Six new C ABI accessors expose attempts,
   failures, policy-chosen full redraws, region count, pixel area and union
   bounds, and four of them ride in the device record. **`damage_failures` is the
@@ -104,7 +367,7 @@ corrected in 0.9.1 above.
   and deployment is a signed transaction with byte-exact readback and
   rollback over key-only USB SSH. The target stays deliberately outside
   the production registry, with a test asserting it.
-- **The GL backend now serves two GPU generations.** `engine/symbian`'s
+- **The GL backend now serves two GPU generations.** `engine/ui-cabi`'s
   renderer split into a generation-independent DrawList walker plus two
   pipelines: the existing ES 2 shader program, and a new fixed-function ES
   1.1 path for GPUs that predate shaders. The two shader lines turned out
@@ -158,7 +421,7 @@ JavaScript where no browser fits.
   `TextField`, the editable activation semantic. DevTools tapes add a
   sparse touch track, e2e gains scripted touch input and the first touch
   goldens, and
-  [docs/TOUCH.md](https://github.com/pocket-stack/pocketjs/blob/main/docs/TOUCH.md)
+  [Touch & gestures](/docs/touch-gestures/)
   writes down the measured cost model.
 - **Audio, credit-based and deterministic.** `globalThis.audio` is a
   spec-first PCM streaming interface: apps push samples against a credit

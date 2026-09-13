@@ -7,14 +7,47 @@ const GH = "https://github.com/pocket-stack/pocketjs";
 const DISCORD = "https://discord.gg/cTce4eXzSK";
 const X_URL = "https://x.com/pocket_js";
 export const SITE_URL = "https://pocketjs.dev";
-export const SITE_TITLE = "PocketJS · Compact JavaScript Runtime for Rich Interactive Software";
+export const SITE_TITLE = "PocketJS · JavaScript UI runtime";
 export const SITE_DESC =
-  "A compact JavaScript runtime for building UI, games, 3D experiences and AI-native applications across radically different devices. A tiny JavaScript guest where it fits; the framework compiled away where it doesn't.";
+  "PocketJS is a portable application runtime that turns modern component code into native pixels across radically different hardware. Solid, Vue Vapor and Octane components compile to one native tree that a Rust core lays out and draws, with no DOM, CSS engine or WebView underneath.";
 // Shared by the standalone homepage and every page rendered through renderPage().
 export const SITE_FOOTER_DESC =
-  "A compact JavaScript runtime for UI, games, 3D and AI-native software, carried to radically different devices by a tiny native core.";
+  "A portable application runtime that turns modern component code into native pixels, carried to radically different hardware by a compact native core.";
 export const SITE_FOOTER_DESC_SLOT = "{{SITE_FOOTER_DESC}}";
 export const OG_IMAGE_URL = `${SITE_URL}/og-image.png`;
+
+// Every icon a browser, a phone home screen or a Safari tab asks for. All of it
+// is rendered from site/assets/favicon.svg by `bun tools/icons.ts`, so the three
+// <head>s on this site (here, the homepage and the /for/ pages) share one list.
+//
+// iOS ignores the manifest when an apple-touch-icon exists and picks the link
+// whose `sizes` is closest to the size it wants, so every rung of that ladder is
+// declared: an iPhone asking for 180 must not settle for a scaled 152. ICON_V
+// versions those URLs because iOS caches the home screen icon per URL and keeps
+// serving a page screenshot if the first fetch ever came up empty; bump it when
+// the drawing changes.
+//
+// Two of these entries exist for Safari specifically. The sizes-less
+// apple-touch-icon is the form Apple documents, at the root name Safari looks
+// for on its own, with no query on it: bookmarks and the Favorites grid read
+// that path rather than the sized ladder the home screen picks from. And Safari
+// could not render an SVG favicon until version 26, so a large PNG favicon has
+// to be declared as well or every Safari before that has only the 96 to scale.
+const ICON_V = "2";
+export const ICON_LINKS = [
+  '<link rel="icon" href="/favicon.svg" type="image/svg+xml">',
+  '<link rel="icon" href="/favicon.ico" sizes="48x48">',
+  '<link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96">',
+  '<link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">',
+  '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
+  `<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=${ICON_V}">`,
+  `<link rel="apple-touch-icon" sizes="167x167" href="/apple-touch-icon-167.png?v=${ICON_V}">`,
+  `<link rel="apple-touch-icon" sizes="152x152" href="/apple-touch-icon-152.png?v=${ICON_V}">`,
+  `<link rel="apple-touch-icon" sizes="120x120" href="/apple-touch-icon-120.png?v=${ICON_V}">`,
+  '<meta name="apple-mobile-web-app-title" content="PocketJS">',
+  '<link rel="mask-icon" href="/safari-pinned-tab.svg" color="#ffd23f">',
+  '<link rel="manifest" href="/site.webmanifest">',
+].join("\n");
 
 export function injectSiteFooterDescription(template: string): string {
   const slots = template.split(SITE_FOOTER_DESC_SLOT).length - 1;
@@ -36,16 +69,13 @@ export interface PageOpts {
   robots?: string;
 }
 
+// The nav mark, drawn inline so the shared shell needs no extra request.
+// Same geometry as site/assets/favicon.svg, which is the source of record.
 export const LOGO = `<svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
-  <defs>
-    <linearGradient id="pj-shell-edge" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#eef6ff"/><stop offset="0.38" stop-color="#b7c8e2"/><stop offset="0.58" stop-color="#7487a0"/><stop offset="0.78" stop-color="#aec0d6"/><stop offset="1" stop-color="#dbe8f6"/></linearGradient>
-    <linearGradient id="pj-shell-lens" x1="7" y1="13" x2="13" y2="19" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#e4edf8"/><stop offset="0.55" stop-color="#a7b8cf"/><stop offset="1" stop-color="#53677f"/></linearGradient>
-    <linearGradient id="pj-shell-bar" x1="16" y1="12" x2="24" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#d7e3f1"/><stop offset="1" stop-color="#71849d"/></linearGradient>
-  </defs>
-  <rect x="2" y="6" width="28" height="20" rx="6" fill="none" stroke="url(#pj-shell-edge)" stroke-width="2.6" stroke-linejoin="round"/>
-  <circle cx="10" cy="16" r="3.1" fill="url(#pj-shell-lens)"/>
-  <rect x="16" y="12.6" width="10" height="2.2" rx="1.1" fill="url(#pj-shell-bar)"/>
-  <rect x="16" y="17.2" width="6.5" height="2.2" rx="1.1" fill="url(#pj-shell-bar)"/>
+  <rect x="2" y="6" width="28" height="20" rx="6" fill="none" stroke="#ffd23f" stroke-width="2.6" stroke-linejoin="round"/>
+  <circle cx="10" cy="16" r="3.1" fill="#ff5f9e"/>
+  <rect x="16" y="12.6" width="10" height="2.2" rx="1.1" fill="#3fd0e8"/>
+  <rect x="16" y="17.2" width="6.5" height="2.2" rx="1.1" fill="#ff5f9e"/>
 </svg>`;
 
 function header(active: string): string {
@@ -55,66 +85,52 @@ function header(active: string): string {
     '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.54 5.34A17.75 17.75 0 0 0 15.07 4c-.19.35-.41.82-.56 1.19a16.5 16.5 0 0 0-5.02 0A12.1 12.1 0 0 0 8.92 4c-1.55.27-3.06.73-4.47 1.34C1.62 9.54.86 13.64 1.24 17.68A17.9 17.9 0 0 0 6.72 20.4c.44-.59.83-1.22 1.16-1.89-.64-.24-1.25-.54-1.83-.89.15-.11.3-.23.44-.35a12.68 12.68 0 0 0 11.02 0c.15.12.29.24.44.35-.58.35-1.2.65-1.84.89.34.67.72 1.3 1.16 1.89a17.85 17.85 0 0 0 5.49-2.72c.45-4.69-.75-8.75-3.22-12.34ZM8.7 15.19c-1.07 0-1.95-.98-1.95-2.18s.86-2.18 1.95-2.18c1.08 0 1.96.98 1.95 2.18 0 1.2-.87 2.18-1.95 2.18Zm6.6 0c-1.07 0-1.95-.98-1.95-2.18s.86-2.18 1.95-2.18c1.08 0 1.96.98 1.95 2.18 0 1.2-.87 2.18-1.95 2.18Z"/></svg>';
   const xIcon =
     '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>';
-  const link = (href: string, label: string, key: string, ext = false, className = "") =>
-    `<a href="${href}"${ext ? ' target="_blank" rel="noreferrer"' : ""} ` +
-    `class="site-nav__link ${className} ${active === key ? "on" : ""}">${label}</a>`;
-  return `<header class="site-nav">
-  <div class="site-nav__in">
-    <a href="/" class="site-brand" aria-label="PocketJS home">
-      ${LOGO}<span class="text-[17px]">PocketJS</span>
+  const link = (href: string, label: string, key: string) =>
+    `<a href="${href}" class="${active === key ? "on" : ""}">${label}</a>`;
+  const ico = (href: string, label: string, svg: string) =>
+    `<a class="ico" href="${href}" target="_blank" rel="noreferrer" aria-label="${label}">${svg}</a>`;
+  return `<header class="nav">
+  <div class="wrap">
+    <a href="/" class="mark" aria-label="PocketJS home">
+      ${LOGO}<span class="nm">PocketJS</span>
     </a>
-    <nav class="site-nav__links" aria-label="Primary">
+    <nav class="nav-links" aria-label="Primary">
       ${link("/docs/overview/", "Docs", "docs")}
-      ${link("/playground/", "Playground", "playground")}
       ${link("/blog/", "Blog", "blog")}
-      ${link("/changelog/", "Changelog", "changelog", false, "site-nav__optional")}
-      <a href="${GH}" target="_blank" rel="noreferrer" class="site-nav__link site-nav__gh" aria-label="PocketJS on GitHub">${ghIcon}</a>
-      <a href="${DISCORD}" target="_blank" rel="noreferrer" class="site-nav__link site-nav__discord" aria-label="PocketJS Discord">${discordIcon}</a>
-      <a href="${X_URL}" target="_blank" rel="noreferrer" class="site-nav__link site-nav__x" aria-label="PocketJS on X">${xIcon}</a>
+      <div class="menu">
+        <button class="menu-btn" aria-haspopup="true" aria-expanded="false">Resources
+          <svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 3l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="menu-list">
+          <a href="/playground/">Playground</a>
+          <a href="/changelog/">Changelog</a>
+        </div>
+      </div>
+      ${ico(X_URL, "PocketJS on X", xIcon)}
+      ${ico(GH, "PocketJS on GitHub", ghIcon)}
+      ${ico(DISCORD, "PocketJS Discord", discordIcon)}
     </nav>
   </div>
 </header>`;
 }
 
-const footer = `<footer class="mt-24 border-t border-line/70 bg-ink-2/60">
-  <div class="mx-auto max-w-6xl px-5 py-12">
-    <div class="grid gap-10 sm:grid-cols-2 lg:grid-cols-4">
-      <div>
-        <div class="flex items-center gap-2 font-semibold text-slate-100">${LOGO}<span>PocketJS</span></div>
-        <p class="mt-3 max-w-xs text-sm text-slate-400">${SITE_FOOTER_DESC}</p>
-      </div>
-      <div class="text-sm">
-        <h4 class="mb-3 font-semibold text-slate-200">Docs</h4>
-        <ul class="space-y-2 text-slate-400">
-          <li><a class="hover:text-brand-2" href="/docs/overview/">Overview</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/getting-started/">Getting started</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/architecture/">Architecture</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/api/">API reference</a></li>
-        </ul>
-      </div>
-      <div class="text-sm">
-        <h4 class="mb-3 font-semibold text-slate-200">Framework</h4>
-        <ul class="space-y-2 text-slate-400">
-          <li><a class="hover:text-brand-2" href="/playground/">Playground</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/components/">Components</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/styling/">Styling</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/animation/">Animation</a></li>
-        </ul>
-      </div>
-      <div class="text-sm">
-        <h4 class="mb-3 font-semibold text-slate-200">Project</h4>
-        <ul class="space-y-2 text-slate-400">
-          <li><a class="hover:text-brand-2" href="/blog/">Blog</a></li>
-          <li><a class="hover:text-brand-2" href="${GH}" target="_blank" rel="noreferrer">GitHub</a></li>
-          <li><a class="hover:text-brand-2" href="${X_URL}" target="_blank" rel="noreferrer">X (Twitter)</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/native-contract/">Native contract</a></li>
-          <li><a class="hover:text-brand-2" href="/docs/build-pipeline/">Build pipeline</a></li>
-        </ul>
-      </div>
-    </div>
-    <div class="mt-10 flex flex-col gap-2 border-t border-line/60 pt-6 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-end">
-      <span>© ${YEAR} PocketJS · MIT</span>
-    </div>
+const footer = `<footer class="foot">
+  <div class="wrap">
+    <span class="hud">© ${YEAR} PocketJS · MIT · a Pocket Lab project</span>
+    <nav class="cols2" aria-label="Footer">
+      <span class="fgrp">
+        <a href="/docs/overview/">Docs</a>
+        <a href="/playground/">Playground</a>
+        <a href="/blog/">Blog</a>
+        <a href="/changelog/">Changelog</a>
+      </span>
+      <span class="fgrp"><span class="fdot" aria-hidden="true">·</span>
+        <a href="${GH}" target="_blank" rel="noreferrer">GitHub</a>
+        <a href="${X_URL}" target="_blank" rel="noreferrer">X</a>
+        <a href="${DISCORD}" target="_blank" rel="noreferrer">Discord</a>
+      </span>
+    </nav>
+    <span class="hud">${SITE_FOOTER_DESC}</span>
   </div>
 </footer>`;
 
@@ -155,8 +171,11 @@ export function renderPage(o: PageOpts): string {
 <meta name="twitter:title" content="${fullTitle}">
 <meta name="twitter:description" content="${desc}">
 <meta name="twitter:image" content="${OG_IMAGE_URL}">
-<meta name="theme-color" content="#05070d">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#171226">
+${ICON_LINKS}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=STIX+Two+Text:ital,wght@0,400;0,600;1,400&family=VT323&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/assets/site.css">
 <script type="application/ld+json">${jsonLd}</script>
 ${o.head ?? ""}
