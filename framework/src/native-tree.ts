@@ -63,6 +63,11 @@ export const rootMirror: NodeMirror = {
   domTag: "root",
 };
 
+// Host-created UI roots share the node arena with the primary root but are
+// not its children. The auxiliary display root is the first such root. Keep
+// them out of detached-node sweeping and treat them as connected boundaries.
+const nativeRoots = new Set<NodeMirror>([rootMirror]);
+
 const DOM_NODE = Symbol.for("pocketjs.native-node");
 const DOM_ELEMENT = 1;
 const DOM_TEXT = 3;
@@ -238,7 +243,7 @@ export function decorateNativeNode(node: NodeMirror): NodeMirror {
       get() {
         let current: NodeMirror | null = node;
         while (current) {
-          if (current === rootMirror) return true;
+          if (nativeRoots.has(current)) return true;
           current = current.parent;
         }
         return false;
@@ -313,7 +318,7 @@ export function setStyleResolver(fn: (cls: string) => number | undefined): void 
 }
 
 /** Non-strict-host miss counters (PSP: don't crash, count). */
-export const missCounters = { unknownClass: 0, unknownTexture: 0 };
+export const missCounters = { unknownClass: 0, unknownTexture: 0, unknownSurface: 0 };
 
 const textures = new Map<string, number>();
 
@@ -359,7 +364,7 @@ export function retain(node: NodeMirror): void {
 /** Undo retain(); a still-detached node re-enters the next sweep. */
 export function release(node: NodeMirror): void {
   retained.delete(node);
-  if (node.parent === null && node !== rootMirror) sweepSet.add(node);
+  if (node.parent === null && !nativeRoots.has(node)) sweepSet.add(node);
 }
 
 function subtreeHasRetained(node: NodeMirror): boolean {
@@ -384,6 +389,7 @@ export function runSweep(): void {
   for (const node of sweepSet) {
     if (!node) continue;
     if (node.parent !== null) continue;
+    if (nativeRoots.has(node)) continue;
     if (subtreeHasRetained(node)) {
       keep.push(node);
       continue;
@@ -399,12 +405,44 @@ export function resetRendererState(): void {
   sweepSet.clear();
   retained.clear();
   rootMirror.children.length = 0;
+  nativeRoots.clear();
+  nativeRoots.add(rootMirror);
+}
+
+/** Mirror a root allocated by the native host before the guest mounts. */
+export function adoptNativeRoot(id: number, tag = "native-root"): NodeMirror {
+  if (!Number.isInteger(id) || id <= ROOT_ID) {
+    throw new Error(`PocketJS: invalid adopted native root id ${id}`);
+  }
+  const root = decorateNativeNode({
+    id,
+    type: NODE_TYPE.view,
+    parent: null,
+    children: [],
+    domNodeType: DOM_ELEMENT,
+    domTag: tag,
+  });
+  nativeRoots.add(root);
+  return root;
+}
+
+/** Forget a native root after its guest-owned children have been destroyed. */
+export function releaseNativeRoot(root: NodeMirror): void {
+  if (root === rootMirror) return;
+  if (root.children.length > 0) {
+    throw new Error("PocketJS: cannot release a native root with mounted children");
+  }
+  nativeRoots.delete(root);
+  sweepSet.delete(root);
+  retained.delete(root);
 }
 
 export function createElement(tag: string): NodeMirror {
   const type = (NODE_TYPE as Record<string, number>)[tag];
   if (type === undefined) {
-    throw new Error(`PocketJS: unknown element <${tag}> - only view/text/image exist`);
+    throw new Error(
+      `PocketJS: unknown element <${tag}> - only view/text/image/surface exist`,
+    );
   }
   return decorateNativeNode({
     id: getOps().createNode(type),
@@ -449,6 +487,28 @@ export function isTextNode(node: NodeMirror): boolean {
   return node.type === NODE_TYPE.text;
 }
 
+/** Imperatively replace a text element's content — the text-shaped sibling of
+ *  `animate()`/`jump()`: per-frame text (count-ups, tickers, percentages)
+ *  drives the native tree through a `nodeRef` instead of re-rendering. On
+ *  replay-rendering frameworks a state commit re-prepares the whole root, so
+ *  this is the difference between one host op and a full-tree walk per tick.
+ *  Accepts the `<Text>` element mirror (updates its text child) or a raw text
+ *  mirror. */
+export function setTextContent(node: NodeMirror, value: string): void {
+  // A <Text> ELEMENT is itself text-typed, but its rendered content lives in
+  // #text child mirrors (static plan text included) — prefer the child, and
+  // only write the node itself when it is a childless text mirror. Writing
+  // the element while a text child exists renders both runs side by side.
+  const target = node.children.find(isTextNode) ?? (isTextNode(node) ? node : undefined);
+  if (target === undefined) {
+    if (getHost().strict) {
+      throw new Error("PocketJS: setTextContent() target has no text child");
+    }
+    return;
+  }
+  replaceText(target, value);
+}
+
 /** Unlink from the current mirror parent (native insertBefore self-unlinks). */
 function unlink(node: NodeMirror): void {
   const p = node.parent;
@@ -460,12 +520,22 @@ function unlink(node: NodeMirror): void {
 
 export function insertNode(parent: NodeMirror, node: NodeMirror, anchor?: NodeMirror | null): void {
   const ops = getOps();
+  if (anchor && (anchor.parent !== parent || !parent.children.includes(anchor))) {
+    throw new Error("PocketJS: insert anchor is not a child of parent");
+  }
+  if (anchor === node) {
+    // DOM pre-insertion re-anchors on the node's next sibling, so inserting a
+    // child before itself is a positional no-op. Solid's keyed reconciler can
+    // emit this during an adjacent swap; neither the mirror nor the native
+    // host should see a detach followed by a now-invalid anchor.
+    sweepSet.delete(node);
+    return;
+  }
   unlink(node);
   sweepSet.delete(node);
   ops.insertBefore(parent.id, node.id, anchor ? anchor.id : 0);
   if (anchor) {
     const i = parent.children.indexOf(anchor);
-    if (i < 0) throw new Error("PocketJS: insert anchor is not a child of parent");
     parent.children.splice(i, 0, node);
   } else {
     parent.children.push(node);
@@ -572,6 +642,42 @@ function setSpriteSrc(node: NodeMirror, value: unknown): void {
   ops.setSprite(node.id, meta.handle, meta.frames, meta.cols, meta.step);
 }
 
+function setCompositorBinding(node: NodeMirror): void {
+  const ops = getOps();
+  const bind = ops.setCompositorSurface;
+  if (!bind) {
+    // A compositor surface is an enhancement on plan-less dev/sim hosts; the
+    // System UI shell keeps its fallback content visible there.
+    return;
+  }
+  if (!ops.__surfaces) {
+    // Surface handles exist only when a resolved Pocket System has been loaded.
+    // Plan-less dev/sim hosts render the shell's fallback content.
+    return;
+  }
+  const packageId = node.domAttrs?.package;
+  const focused = node.domAttrs?.focused === true ? 1 : 0;
+  if (packageId == null || packageId === "") {
+    bind(node.id, -1, focused);
+    return;
+  }
+  if (typeof packageId !== "string") {
+    throw new Error("PocketJS: compositor surface package must be a string id");
+  }
+  const handle = ops.__surfaces[packageId];
+  if (handle === undefined) {
+    if (getHost().strict) {
+      throw new Error(
+        `PocketJS: package ${JSON.stringify(packageId)} is not installed in this Pocket System`,
+      );
+    }
+    missCounters.unknownSurface++;
+    bind(node.id, -1, focused);
+    return;
+  }
+  bind(node.id, handle, focused);
+}
+
 type StyleObject = Record<string, number | string>;
 
 function setStyleObject(node: NodeMirror, value: unknown, prev: unknown): void {
@@ -614,6 +720,10 @@ export function setProp<T>(node: NodeMirror, name: string, value: T, prev?: T): 
       return value;
     case "sprite":
       setSpriteSrc(node, value);
+      return value;
+    case "package":
+    case "focused":
+      setCompositorBinding(node);
       return value;
     case "style":
       setStyleObject(node, value, prev);

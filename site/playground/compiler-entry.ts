@@ -18,12 +18,17 @@ import { parse as parseFont, type Font } from "opentype.js";
 import { compileClasses, fontSlotInfo } from "../../framework/compiler/tailwind.ts";
 import { registerAnimationTheme } from "../../framework/compiler/animation.ts";
 import motionsConfig from "../../apps/motions/pocket.config.ts";
+import musicConfig from "../../apps/music/pocket.config.ts";
 
 // The playground compiles single-file demos without their app-dir
-// pocket.config.ts, so install the motions demo's keyframe/animation theme
-// (superset of the built-ins) as the playground-wide default — this is what
-// lets the homepage/blog motion studies stay live-editable.
-registerAnimationTheme(motionsConfig.theme);
+// pocket.config.ts, so install the demo themes that define keyframes —
+// motions (the homepage/blog motion studies) and music (the Octane
+// equalizer's baked bar timelines) — merged as the playground-wide default.
+// Namespaces are disjoint; a collision would mean a demo rename, not magic.
+registerAnimationTheme({
+  keyframes: { ...motionsConfig.theme?.keyframes, ...musicConfig.theme?.keyframes },
+  animation: { ...motionsConfig.theme?.animation, ...musicConfig.theme?.animation },
+});
 import { bakeSlot } from "../../framework/compiler/bake-font.ts";
 import {
   PAK_DTYPE,
@@ -44,7 +49,19 @@ import { PSM } from "../../contracts/spec/spec.ts";
  *  runtime helpers from. The playground import-map points it at runtime.js. */
 const SOLID_RENDERER_MODULE = "@pocketjs/framework/solid/renderer";
 
-type PlaygroundFramework = "solid" | "vue-vapor";
+/** Octane universal-renderer descriptor — mirrors framework/compiler/jsx-plugin.ts
+ *  OCTANE_RENDERER_DESCRIPTOR; the import map points the module id at
+ *  runtime-octane.js. */
+const OCTANE_RENDERER = {
+  id: "pocket",
+  module: "@pocketjs/framework/octane/renderer",
+  target: "universal",
+  server: "unsupported",
+  text: "host",
+  capabilities: ["portal"],
+} as const;
+
+type PlaygroundFramework = "solid" | "vue-vapor" | "octane";
 
 interface SpriteMeta {
   cols: number;
@@ -67,7 +84,7 @@ export interface CompileResult {
 }
 
 // ---------------------------------------------------------------------------
-// pass-1 collector — mirrors framework/compiler/solid-plugin.ts makeCollector: candidate
+// pass-1 collector — mirrors framework/compiler/jsx-plugin.ts makeCollector: candidate
 // class strings + text codepoints from the PRISTINE AST, plus the same loud
 // lints (classList / interpolated class / banned solid imports / HTML entities).
 // ---------------------------------------------------------------------------
@@ -158,9 +175,10 @@ function collectorPlugin(out: Collected, framework: PlaygroundFramework): Plugin
 
 /** Run the exact build transform in the browser. Throws with a code frame on
  *  lint/syntax errors (message carries the frame). */
-async function transform(
+export async function transformAppSource(
   source: string,
   framework: PlaygroundFramework,
+  baseUrl = typeof location === "undefined" ? "https://pocketjs.dev/" : location.href,
 ): Promise<{ code: string; collected: Collected }> {
   const collected: Collected = { classStrings: [], codepoints: new Set() };
   let res;
@@ -179,7 +197,7 @@ async function transform(
       "app.tsx",
       {
         compiler: {
-          runtimeModuleName: new URL("/pg/vue-jsx-vapor/vapor.js", location.href).href,
+          runtimeModuleName: new URL("/pg/vue-jsx-vapor/vapor.js", baseUrl).href,
         },
       },
       false,
@@ -194,6 +212,23 @@ async function transform(
       configFile: false,
       sourceMaps: false,
     });
+  } else if (framework === "octane") {
+    await transformAsync(source, {
+      filename: "app.tsx",
+      presets: [[tsPreset, {}]],
+      parserOpts: { plugins: ["jsx"] },
+      plugins: [collectorPlugin(collected, framework)],
+      babelrc: false,
+      configFile: false,
+      sourceMaps: false,
+    });
+    // Load this branch lazily. Octane marks its package side-effect free; a
+    // static import from 0.1.26 was pruned by Bun while its call site survived,
+    // leaving every Octane demo with an undefined minified binding.
+    const { compile } = await import("octane/compiler");
+    res = compile(source, "app.tsx", { mode: "client", renderer: OCTANE_RENDERER }) as {
+      code: string;
+    };
   } else {
     res = await transformAsync(source, {
       filename: "app.tsx",
@@ -262,10 +297,22 @@ const nearestPow2 = (n: number) => {
   return Math.max(8, Math.min(512, p));
 };
 
+function svgImageBlob(source: string): Blob {
+  const normalized = /<svg\b[^>]*\bxmlns\s*=/i.test(source)
+    ? source
+    : source.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  return new Blob([normalized], { type: "image/svg+xml" });
+}
+
 async function rasterizeImage(name: string): Promise<DecodedImage> {
   const res = await fetch(assetBase + name).catch(() => null);
   if (!res || !res.ok) return placeholderImage();
-  const blob = await res.blob();
+  // SVG markup copied from app directories is also accepted by native builds,
+  // where an XML namespace is optional. Browser image decoders require it on
+  // standalone SVG blobs, so normalize the root before creating the image URL.
+  const blob = name.toLowerCase().endsWith(".svg")
+    ? svgImageBlob(await res.text())
+    : await res.blob();
   const url = URL.createObjectURL(blob);
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
@@ -309,7 +356,7 @@ export async function compileApp(
   } = {},
 ): Promise<CompileResult> {
   const framework = opts.framework ?? "solid";
-  const { code, collected } = await transform(source, framework);
+  const { code, collected } = await transformAppSource(source, framework);
 
   const styles = compileClasses(collected.classStrings);
   const atlases = await bakeAtlases(collected.codepoints, styles.usedFontSlots, opts.extraChars ?? "");

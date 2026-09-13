@@ -17,6 +17,7 @@ function plan(
     app: {
       id,
       title,
+      version: "0.1.0",
       entry: "app/main.tsx",
       output,
       framework: "solid",
@@ -27,8 +28,10 @@ function plan(
       physical: [640, 360],
       presentation: "native",
       rasterDensity: 1,
+      policy: "dynamic",
     },
     features: {},
+    companions: [],
     planHash: `sha256:${"0".repeat(64)}`,
   };
 }

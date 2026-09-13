@@ -35,6 +35,8 @@ export const NODE_TYPE = {
   view: 0,
   text: 1,
   image: 2,
+  /** A native-compositor slot for an installed Pocket application. */
+  surface: 3,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +96,8 @@ export const SIZE_FULL = -1;
 //   loadStyles(buf) / loadFontAtlas(buf)   [web/test hosts only; PSP feeds core
 //                                           natively from the pak]
 //   measureText(str, fontSlot) -> width:f32
+//   setCompositorSurface(id, handle, focusedInt) [surface nodes only; handle
+//                                                  < 0 clears]
 
 export const OP = {
   createNode: 1,
@@ -225,6 +229,54 @@ export const OP = {
   //                      undo it; consoles are 480x272).
   //                      Valid inside the summoned launcher guest until the
   //                      next switch; -1 otherwise.
+  // -- touch hit facts (input.touch capability; docs/TOUCH.md) ---------------
+  hitTestBounds: 42, //   (x: f32, y: f32) -> topmost node id at that logical
+  //                      point by LAYOUT BOX alone, or 0. The same paint-order
+  //                      walk as hitTest (clips, transforms, opacity culling,
+  //                      display:none) minus the paints-something requirement:
+  //                      pure layout containers claim their box (UIKit bounds
+  //                      semantics — a finger in a list's row gap still owns
+  //                      the list). This is the cold-path QUERY form of the
+  //                      touch hit FACT: a host with input.touch resolves it
+  //                      once per contact at the DOWN edge against the
+  //                      committed frame, carries it for the contact's
+  //                      lifetime, and delivers it as frame() argument 4
+  //                      (`hits`, parallel to `touches`; see the frame
+  //                      contract note on that argument). The guest only
+  //                      issues this op when no fact channel exists (devtools
+  //                      replay, injected test hosts, older wasm builds).
+  // -- text wrap (the platform half of soft-wrap layout; docs/BACKENDS.md) --
+  wrapText: 43, //        (str: string, fontSlot: i32, maxW: f32) -> u32[].
+  //                      Soft-wrap break columns for ONE line of text under
+  //                      maxW px, ascending UTF-16 code-unit indices (empty
+  //                      = the line fits). The engine computes
+  //                      greedy word wrap over the SAME provider that
+  //                      measures and paints the slot (atlas advances, or
+  //                      the native measurer for native-text apps): break
+  //                      BEFORE the word that overflows, space runs hang
+  //                      past maxW on the row they follow, a word wider than
+  //                      a whole row splits at character level. Native-text
+  //                      backends may install a host wrapper next to the
+  //                      measurer (Ui::set_text_wrap — gpui's LineWrapper)
+  //                      and its break positions win. Wrapped-coordinate
+  //                      bookkeeping (visual rows, caret/selection mapping)
+  //                      stays app-side — this op is the "where may it
+  //                      break" half only. Hosts without it: applications
+  //                      implement matching greedy rules over measureText.
+  setCompositorSurface: 44, // (id, surfaceHandle, focusedInt). Binds an
+  //                      Pocket System package surface to a NODE_TYPE.surface
+  //                      node. The core emits SURFACE_QUAD in ordinary paint
+  //                      order with BOTH full and clipped bounds; no image or
+  //                      texture semantics are involved. focusedInt is the
+  //                      shell's focus fact consumed by the native compositor
+  //                      for input and scheduling. handle < 0 clears.
+  // -- additional UI outputs (display.auxiliary capability) ----------------
+  hitTestAuxiliary: 45, // (x: f32, y: f32) -> topmost painted node id in the
+  //                      auxiliary output's logical coordinate space, or 0.
+  //                      Same semantics as hitTest; never searches primary.
+  hitTestBoundsAuxiliary: 46, // bounds-only twin for auxiliary touch facts.
+  //                      Same semantics as hitTestBounds; never searches
+  //                      primary. Hosts omit both ops without the capability.
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -269,6 +321,12 @@ export const PROP = {
   display: 29, //       enum Display
   overflow: 30, //      enum Overflow (hidden => scissor in draw)
   zIndex: 31, //        i32 (paint order among siblings; layout-group id but paint-only)
+  hitPass: 32, //       0|1. 1 = the node's OWN box never claims a hit (ink or
+  //                    bounds walk alike); descendants are still tested — the
+  //                    engine's pointer-events:none, self-only. The framework
+  //                    marks its full-screen overlay/portal layers with it so
+  //                    bounds hit facts (op 42) resolve through empty overlay
+  //                    space to the app content beneath.
 
   // -- visual (64..95) -------------------------------------------------------
   bgColor: 64, //       color u32 ABGR
@@ -296,6 +354,8 @@ export const PROP = {
   bevelInnerLight: 79, // color u32 ABGR
   bevelInnerDark: 80, //  color u32 ABGR
   bevelWidth: 81, //      f32 px per ring (default 1)
+  gradVia: 82, //         color u32 ABGR (optional middle gradient stop)
+  gradViaPos: 83, //      f32 0..1; NAN = no middle stop
 
   // -- text (96..127) --------------------------------------------------------
   textColor: 96, //     color u32 ABGR
@@ -446,6 +506,7 @@ export const PROP_VALUE_KIND: Record<PropName, number> = {
   insetT: VALUE_KIND.f32, insetR: VALUE_KIND.f32,
   insetB: VALUE_KIND.f32, insetL: VALUE_KIND.f32,
   display: VALUE_KIND.int, overflow: VALUE_KIND.int, zIndex: VALUE_KIND.int,
+  hitPass: VALUE_KIND.int,
   bgColor: VALUE_KIND.color, gradFrom: VALUE_KIND.color, gradTo: VALUE_KIND.color,
   gradDir: VALUE_KIND.int, radius: VALUE_KIND.f32, opacity: VALUE_KIND.f32,
   borderColor: VALUE_KIND.color, borderWidth: VALUE_KIND.f32,
@@ -453,6 +514,7 @@ export const PROP_VALUE_KIND: Record<PropName, number> = {
   bevelOuterLight: VALUE_KIND.color, bevelOuterDark: VALUE_KIND.color,
   bevelInnerLight: VALUE_KIND.color, bevelInnerDark: VALUE_KIND.color,
   bevelWidth: VALUE_KIND.f32,
+  gradVia: VALUE_KIND.color, gradViaPos: VALUE_KIND.f32,
   textColor: VALUE_KIND.color, fontSlot: VALUE_KIND.int,
   textAlign: VALUE_KIND.int, lineHeight: VALUE_KIND.f32, tracking: VALUE_KIND.f32,
   translateX: VALUE_KIND.f32, translateY: VALUE_KIND.f32,
@@ -740,6 +802,95 @@ export const STREAM_CHUNK_HEADER_SIZE = 16;
 export const STREAM_FLAG_ENDED = 1 << 0;
 
 // ---------------------------------------------------------------------------
+// SVC WIRE protocol (PKNT) — the svc mailbox over a socket
+// ---------------------------------------------------------------------------
+// The PSP reaches its companion host through PSPLINK's usbhostfs file share
+// (SVC above); hosts without a shared filesystem (the Vita, over WiFi) speak
+// the SAME mailbox + side-file + .pkst semantics over one TCP connection.
+// One connection on purpose: TCP ordering is load-bearing — STREAM_OPEN
+// precedes the JSON line announcing it, FILE pushes precede the results line
+// that references them — and a second channel would reintroduce exactly the
+// cross-channel races the file transport never had.
+//
+// Discovery: the host broadcasts a UDP beacon once a second on
+// WIRE_BEACON_PORT; the datagram's SOURCE ADDRESS is the connect target.
+//
+//   Beacon datagram:
+//     off 0  u32  magic    = 0x42444b50  bytes 'P','K','D','B'
+//     off 4  u8   version  = WIRE_VERSION
+//     off 5  u8   reserved (0)
+//     off 6  u16  tcpPort  the WIRE listener's port
+//     off 8  u8   appLen, then app id bytes (the pocket-svc app segment)
+//     ...    u8   nameLen, then a display name (<= 32 bytes, for pickers)
+//
+// Handshake (before any frame):
+//   device -> host:  u32 magic 'PKNT' · u8 version · u8 reserved ·
+//                    u8 appLen · app id bytes
+//   host -> device:  u32 magic 'PKNT' · u8 acceptedVersion · u8 flags (0) ·
+//                    u16 reserved
+// A magic/version/app mismatch closes the socket.
+//
+// Every subsequent message, both directions, is one frame:
+//
+//   Frame header (WIRE_HEADER_SIZE = 8 bytes):
+//     off 0  u8   type      (WIRE_MSG)
+//     off 1  u8   flags     type-specific (see below)
+//     off 2  u16  reserved (0)
+//     off 4  u32  payloadLen (<= WIRE_MAX_PAYLOAD; oversize closes the socket)
+//
+// Types (unknown types are skipped by length — forward compatible):
+//   ping (h->d)        u32 token, every ~2 s; either side drops the
+//   pong (d->h)        connection after ~10 s of silence. Pong echoes.
+//   ctrl (both)        one UTF-8 JSON line, no trailing \n — the in.jsonl /
+//                      out.jsonl mailbox semantics (<= SVC_POLL_BUF bytes).
+//   file (h->d)        u16 pathLen · path (svc-relative, side_path rules) ·
+//                      whole IMG-entry bytes (<= SVC_IMG_MAX_BYTES). Pushed
+//                      PROACTIVELY before the ctrl line that references it,
+//                      so a synchronous loadImgFile hits a warm device cache.
+//   streamOpen (h->d)  u16 pathLen · path (what the announce line will name)
+//                      · the verbatim 96-byte .pkst header block. The device
+//                      allocates a RAM ring image (stream_rx.rs) — every
+//                      streamOpen is a full ring reset.
+//   streamClose (h->d) empty payload.
+//   videoSlot (h->d)   u32 seq · u32 frameIndex · u16 w · u16 h ·
+//                      u16 flags (bit 0 = indices PackBits-RLE) · u16 rsv ·
+//                      u8[1024] palette · indices (raw w*h, or RLE decoding
+//                      to exactly w*h). Applied payload-first, seq-published-
+//                      after into the RAM ring, preserving the .pkst torn-
+//                      frame contract verbatim.
+//   audioChunk (h->d)  u32 seq · u32 startFrame · s16 PCM, exactly
+//                      chunkFrames*channels samples.
+//   streamMark (h->d)  u32 epoch · u16 flags (bit 0 = ended) · u16 reserved —
+//                      carries bumpEpoch()/markEnded() into the ring header.
+
+export const WIRE_MAGIC = 0x544e4b50; // 'PKNT' LE
+export const WIRE_BEACON_MAGIC = 0x42444b50; // 'PKDB' LE
+export const WIRE_VERSION = 1;
+export const WIRE_HEADER_SIZE = 8;
+export const WIRE_MAX_PAYLOAD = 256 * 1024;
+/** UDP discovery beacon (host broadcasts; device listens). */
+export const WIRE_BEACON_PORT = 8621;
+/** The host's TCP listener for the framed protocol. */
+export const WIRE_PORT = 8622;
+export const WIRE_MSG = {
+  ping: 0x01,
+  pong: 0x02,
+  ctrl: 0x10,
+  file: 0x20,
+  streamOpen: 0x30,
+  streamClose: 0x31,
+  videoSlot: 0x32,
+  audioChunk: 0x33,
+  streamMark: 0x34,
+} as const;
+/** videoSlot leading fields (seq..reserved) — the palette follows. */
+export const WIRE_SLOT_HEADER_SIZE = 16;
+export const WIRE_CHUNK_HEADER_SIZE = 8;
+export const WIRE_MARK_SIZE = 8;
+export const WIRE_SLOT_FLAG_RLE = 1 << 0;
+export const WIRE_MARK_FLAG_ENDED = 1 << 0;
+
+// ---------------------------------------------------------------------------
 // Font slots
 // ---------------------------------------------------------------------------
 // A "font slot" is one baked (family-weight, px) atlas. The compiler derives
@@ -747,7 +898,9 @@ export const STREAM_FLAG_ENDED = 1 << 0;
 // regular + bold — see docs/DESIGN.md). Slot indices are assigned by the build and
 // carried in each atlas header; the core just indexes a table.
 
-export const MAX_FONT_SLOTS = 16;
+// 0..6 regular / 7..13 bold (FONT_PX sizes), 14/15 the 54 px display pair,
+// 16..18 monospace regular (12/14/16 px — `font-mono`, code spans).
+export const MAX_FONT_SLOTS = 24;
 
 // ---------------------------------------------------------------------------
 // STYLE TABLE binary format — styles.bin  (version 2)
@@ -1256,6 +1409,40 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                           perspective variation (projectively correct UVs
 //                           at every cell corner), so interior texture lines
 //                           do not kink at triangle diagonals.
+//   TEXT_RUN    (8 + ceil(n/4) words):
+//                           op,
+//                           word1: bits 0-7 fontSlot,
+//                                  bits 8-15 TextAlign ordinal,
+//                           originX, originY, boxW, lineHeight (f32 bits;
+//                           content-box top-left + width in logical px;
+//                           lineHeight NaN = the slot's default),
+//                           color,
+//                           byteLen (u32), then ceil(n/4) words of the run
+//                           string's UTF-8 bytes packed little-endian and
+//                           zero-padded. Emitted ONLY when the host installed
+//                           a native text measurer (docs/BACKENDS.md) and the
+//                           node's recorded provider is native; every other
+//                           run keeps GLYPH_RUN, so fixed-function backends
+//                           (PSP GE, PPA, software raster) never see this op.
+//                           The backend decodes and shapes the bytes with the
+//                           host text system. The words alone are the COMPLETE
+//                           pixel truth — no side table — so DrawList
+//                           snapshots, demand-render hashes and damage diffs
+//                           stay exact by construction. originX/Y are f32
+//                           (NOT the i16 XY packing) and are exempt from the
+//                           i16 clip guarantee: a run may start off-viewport,
+//                           and the core brackets any partially-clipped run
+//                           in SCISSOR/SCISSOR_POP.
+//   SURFACE_QUAD (9 words): op, surfaceHandle,
+//                           fullX, fullY, fullW, fullH (f32 bits; the shell
+//                           node's unclipped logical bounds), clipXY, clipWH
+//                           (the visible integer destination after every
+//                           enclosing clip), flags (bit 0 = focused).
+//                           This is a native compositor instruction. It owns
+//                           no pixels in software/fixed-function backends and
+//                           is emitted exactly where the surface node occurs
+//                           in shell painter order, so later shell ops remain
+//                           above the child surface.
 
 export const DRAW_OP = {
   rect: 1,
@@ -1266,6 +1453,8 @@ export const DRAW_OP = {
   scissorPop: 6,
   tri: 7,
   texTri: 8,
+  textRun: 9,
+  surfaceQuad: 10,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -1299,6 +1488,15 @@ export const PAK_DTYPE = {
 // ---------------------------------------------------------------------------
 // Verified against dreamcart web/engine.js (BTN), framework/src/input.ts (Btn)
 // and rust-psp/psp/src/sys/ctrl.rs (CtrlButtons).
+//
+// ZL/ZR are the one addition to the PSP set: a machine can have more shoulder
+// buttons than a PSP did (a New 3DS has four), and an app that wants a HELD
+// modifier has nowhere else to put it — every other bit already means
+// something an app is using. They take two of the gap bits the PSP never
+// assigned, so the mask stays inside the 16-bit window real PSP hardware uses
+// (0x10000 is HOME and 0x20000 is HOLD there). A host without them simply
+// never sets the bits, and an app must treat them as an enhancement: no
+// input.buttons contract promises they exist.
 
 export const BTN = {
   SELECT: 0x0001,
@@ -1309,6 +1507,8 @@ export const BTN = {
   LEFT: 0x0080,
   LTRIGGER: 0x0100,
   RTRIGGER: 0x0200,
+  ZL: 0x0400,
+  ZR: 0x0800,
   TRIANGLE: 0x1000,
   CIRCLE: 0x2000,
   CROSS: 0x4000,
@@ -1325,11 +1525,15 @@ export const BTN = {
 // is unchanged. Deadzone/normalization is runtime policy (framework/src/frame.ts), not
 // host policy — hosts pass the raw value through.
 
+// Optional sixth frame argument carries the right stick with identical packing.
+// Omission reads as center; touch/hit/surface arguments retain their positions.
 export const ANALOG_CENTER = 0x8080;
 
 // ---------------------------------------------------------------------------
 // Fixed timestep
 // ---------------------------------------------------------------------------
-/** Core animation/tick timestep: exactly 1/60 s. Frame content is a pure
- *  function of frame index — this is what makes byte-exact goldens possible. */
+/** Core animation/tick timestep: exactly 1/60 s unless the realm declared
+ *  another rate before its first tick (Ui::set_tick_rate; still fixed for
+ *  the whole run — 1/hz s, hz at most 240). Frame content is a pure function
+ *  of frame index — this is what makes byte-exact goldens possible. */
 export const FIXED_DT = 1 / 60;

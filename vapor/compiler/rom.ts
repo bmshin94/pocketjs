@@ -1,18 +1,23 @@
 // vapor/compiler/rom.ts — drive the console toolchains and patch cart headers.
-// Four targets, four toolchains, one generated C file:
+// ROM/firmware targets plus Playdate packages, one generated C file:
 //   GBA: arm-none-eabi-gcc, flat ROM, Nintendo-logo/checksum patch
 //   GB:  sdcc (SM83) + sdasgb + makebin + rgbfix, ROM-only cart
 //   NES: cc65/ca65/ld65, NROM-256 + CHR-ROM font, generated ld65 config
 //   ESP32: ESP-IDF, retained build project + app image for offset 0x10000
+//   Playdate: SDK CMake, independent Simulator/device .pdx packages
 // Toolchain recipes carry over from Pocket Static's target packagers.
 
 import { $ } from "bun";
 import { dirname, join } from "node:path";
 import { nesFontBytes, VAPOR_TARGETS, type CompiledApp, type VaporTargetName } from "./compile.ts";
 import { buildEsp32Firmware } from "./esp32.ts";
+import {
+  buildPlaydatePackages,
+  type PlaydateBuildMode,
+} from "./playdate.ts";
 
 const RUNTIME = join(import.meta.dir, "..", "runtime");
-const CC65_LIB = "/opt/homebrew/share/cc65/lib/none.lib";
+const CC65_LIB = process.env.CC65_LIB ?? "/opt/homebrew/share/cc65/lib/none.lib";
 
 // The GBA BIOS validates these 156 bytes at boot on real hardware; every
 // homebrew toolchain (gbafix, devkitARM, tonc) ships the same table.
@@ -40,17 +45,72 @@ function targetDefines(target: VaporTargetName): string[] {
   ];
 }
 
+export interface BuiltArtifact {
+  path: string;
+  kind: "rom" | "firmware" | "pdx";
+  bytes: number;
+  platform?: "simulator" | "device";
+}
+
+export interface BuildRomOptions {
+  playdateMode?: PlaydateBuildMode;
+}
+
+type SingleArtifactTarget = Exclude<VaporTargetName, "playdate">;
+
+async function buildSingleArtifact(
+  app: CompiledApp,
+  target: SingleArtifactTarget,
+  outPath: string,
+): Promise<BuiltArtifact> {
+  if (target === "gba") {
+    const { romBytes } = await buildGbaRom(app, outPath);
+    return { path: outPath, kind: "rom", bytes: romBytes };
+  }
+  if (target === "gb") {
+    const { romBytes } = await buildGbRom(app, outPath);
+    return { path: outPath, kind: "rom", bytes: romBytes };
+  }
+  if (target === "nes") {
+    const { romBytes } = await buildNesRom(app, outPath);
+    return { path: outPath, kind: "rom", bytes: romBytes };
+  }
+  if (target === "esp32") {
+    const { romBytes } = await buildEsp32Firmware(app, outPath);
+    return { path: outPath, kind: "firmware", bytes: romBytes };
+  }
+  target satisfies never;
+  throw new Error(`unsupported Pocket Vapor target: ${String(target)}`);
+}
+
+/**
+ * Build the distributable artifact set for one Vapor target.
+ *
+ * `buildRom` is the stable public entry-point name. Its result is deliberately
+ * plural: console targets and ESP32 return one artifact, while Playdate
+ * `both` returns independent Simulator and device packages because a native
+ * .pdx cannot contain both executable flavors.
+ */
 export async function buildRom(
   app: CompiledApp,
   target: VaporTargetName,
-  outRom: string,
-): Promise<{ romBytes: number }> {
-  if (target === "gba") return buildGbaRom(app, outRom);
-  if (target === "gb") return buildGbRom(app, outRom);
-  if (target === "nes") return buildNesRom(app, outRom);
-  if (target === "esp32") return buildEsp32Firmware(app, outRom);
-  target satisfies never;
-  throw new Error(`unsupported Pocket Vapor target: ${String(target)}`);
+  outPath: string,
+  options: BuildRomOptions = {},
+): Promise<BuiltArtifact[]> {
+  if (target === "playdate") {
+    const packages = await buildPlaydatePackages(
+      app,
+      outPath,
+      options.playdateMode ?? "simulator",
+    );
+    return packages.map(({ path, kind, platform, bytes }) => ({
+      path,
+      kind,
+      platform,
+      bytes,
+    }));
+  }
+  return [await buildSingleArtifact(app, target, outPath)];
 }
 
 // ---- GBA -------------------------------------------------------------------
@@ -126,7 +186,11 @@ MEMORY {
   CHR: start = $0000, size = $2000, type = ro, file = %O, fill = yes;
   ZP: start = $0002, size = $00fa, type = rw;
   DEBUGRAM: start = $0200, size = $0358, type = rw;
-  RAM: start = $0558, size = $01a8, type = rw;
+  # RAM ends at $0720; the cc65 soft stack runs $0720-$07FF (crt0 inits sp
+  # to $07FF). The 32-byte extension over the old $0700 boundary is funded
+  # by the overlay allocator: the >=42 B of vp_sb/vp_view frames it moved
+  # off the deepest stack path exceed the 32 B taken, so stack margin grows.
+  RAM: start = $0558, size = $01c8, type = rw;
 }
 SEGMENTS {
   HEADER: load = HDR, type = ro;

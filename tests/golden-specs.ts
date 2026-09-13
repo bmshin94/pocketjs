@@ -1,10 +1,47 @@
-import { BTN } from "../contracts/spec/spec.ts";
+import { BTN, SCREEN_H, SCREEN_W } from "../contracts/spec/spec.ts";
+import {
+  layoutRows,
+  OSK_GAP,
+  OSK_H,
+  OSK_LAYERS,
+  OSK_PAD,
+  OSK_ROW_H,
+} from "../framework/src/osk-layout.ts";
+
+export interface TouchPoint {
+  id: number;
+  x: number;
+  y: number;
+}
 
 export interface GoldenSpec {
   name: string;
+  /** App bundle to build/run — defaults to `name`. Set it when several specs
+   *  exercise one app (golden files keep the spec's own name). */
+  app?: string;
   frames: number;
   capture: number[];
   input?: (frame: number) => number;
+  /** Scripted front-panel contacts for the frame, logical px. Undefined or
+   *  [] = no contacts. Runs on hosts that deliver touch (vita, wasm oracle). */
+  touch?: (frame: number) => readonly TouchPoint[];
+}
+
+/** Center of an OSK key on the given layer, in screen px (panel docked at
+ *  the bottom of the screen — the system convention). */
+function oskKeyCenter(ch: string, layer: keyof typeof OSK_LAYERS = "lower"): { x: number; y: number } {
+  const rows = layoutRows(OSK_LAYERS[layer], SCREEN_W - 2 * OSK_PAD);
+  for (const row of rows) {
+    for (const k of row) {
+      if (k.key.ch === ch) {
+        return {
+          x: Math.round(OSK_PAD + k.x + k.w / 2),
+          y: Math.round(SCREEN_H - OSK_H + OSK_PAD + k.row * (OSK_ROW_H + OSK_GAP) + OSK_ROW_H / 2),
+        };
+      }
+    }
+  }
+  throw new Error(`golden-specs: no ${JSON.stringify(ch)} key on layer ${String(layer)}`);
 }
 
 // Shared by the headless WASM oracle and Vita3K E2E so inputs/frame indices
@@ -167,6 +204,85 @@ export const GOLDEN_SPECS: GoldenSpec[] = [
                     ? BTN.START
                     : 0,
   },
+  {
+    // im, driven by TOUCH — the first touch golden. CIRCLE@60 opens MAYA
+    // CHEN, TRIANGLE@90 opens the OSK. A finger lands on 'h' at f120 and
+    // HOLDS — f124 captures the pressed key (the native active: variant, a
+    // state no button tape can show under touch). Release at f128 commits
+    // (the modern press model); a tap types 'i' at f150..152. f180 shows
+    // the live "hi" draft. START@210 sends; f300 has the delivered bubble.
+    name: "im-touch",
+    app: "im-main",
+    frames: 310,
+    capture: [124, 180, 300],
+    input: (f) => (f === 60 ? BTN.CIRCLE : f === 90 ? BTN.TRIANGLE : f === 210 ? BTN.START : 0),
+    touch: (f) => {
+      if (f >= 120 && f < 128) return [{ id: 0, ...oskKeyCenter("h") }];
+      if (f >= 150 && f < 152) return [{ id: 0, ...oskKeyCenter("i") }];
+      return [];
+    },
+  },
+  {
+    // App-layer touch through the whole host stack: a tap on a conversation
+    // row must open the thread via the default activation recognizer — the
+    // coverage that was missing when every hardware touch resolved to the
+    // TextField's portal host (fix/portal-hit-pass). f40 = the list; f90 =
+    // after the tap resolved.
+    name: "im-rowtap",
+    app: "im-main",
+    frames: 100,
+    capture: [40, 90],
+    input: () => 0,
+    touch: (f) => {
+      if (f >= 60 && f < 64) return [{ id: 0, x: 240, y: 90 }];
+      return [];
+    },
+  },
+];
+
+/**
+ * Specs for the 400x240 Nintendo 3DS top screen (tools/3ds-profile.ts), kept
+ * out of GOLDEN_SPECS on purpose: that array drives the 480x272 wasm oracle in
+ * tests/golden.ts and the Vita driver, and neither can run an app whose only
+ * viewport is 400x240. Same GoldenSpec type and the same encoders, so
+ * tests/e2e/azahar.ts shares every mechanism with the other drivers.
+ *
+ * The spec name is the app DIRECTORY, as in every other driver. The built
+ * artifact is a different string — `resolve.ts` refuses a derived output that
+ * does not start with a letter, so apps/3ds-demo builds as
+ * pocket3ds-demo-main — and the driver reads it off the manifest rather than
+ * from the spec.
+ */
+export const THREE_DS_GOLDEN_SPECS: GoldenSpec[] = [
+  {
+    name: "3ds-demo",
+    frames: 70,
+    capture: [2, 10, 20, 44, 56, 64],
+    input: () => 0,
+    // Drag upward across the bottom screen. Frame 10 captures finger-follow;
+    // release on frame 12 starts inertia, and later captures prove that the
+    // auxiliary VirtualList keeps re-windowing through the shared gesture and
+    // scroller contracts — and that the search header has scrolled away while
+    // the section header pins to the top of the table. A tap on frames 30-31
+    // selects the row under the finger, which is the only thing that writes
+    // the primary display's detail card. A third contact drags the right-edge
+    // A-Z index (which starts below the 36 px navigation bar) from the first
+    // section to the last: frame 56 captures a mid-alphabet section, frame 64
+    // proves the virtual window settled at section Z, and both prove the card
+    // holds the tapped contact while the list scrubs away underneath it.
+    touch: (frame) => {
+      if (frame >= 5 && frame <= 11) {
+        return [{ id: 0, x: 160, y: 210 - (frame - 5) * 30 }];
+      }
+      if (frame >= 30 && frame <= 31) {
+        return [{ id: 1, x: 160, y: 120 }];
+      }
+      if (frame >= 52 && frame <= 58) {
+        return [{ id: 2, x: 310, y: 40 + (frame - 52) * 33 }];
+      }
+      return [];
+    },
+  },
 ];
 
 export function encodeThresholdInput(spec: GoldenSpec): string {
@@ -181,4 +297,33 @@ export function encodeThresholdInput(spec: GoldenSpec): string {
     }
   }
   return entries.join(",");
+}
+
+/** Level-triggered touch script for the capture hosts: `frame:id,x,y[+…]`
+ *  entries joined by `;`, `frame:-` releases. Touch-free specs encode to ""
+ *  so button-only builds stay byte-identical. */
+export function encodeTouchInput(spec: GoldenSpec): string {
+  if (!spec.touch) return "";
+  const lastFrame = Math.max(...spec.capture);
+  const entries: string[] = [];
+  let previous = "";
+  for (let frame = 0; frame <= lastFrame; frame++) {
+    const contacts = spec.touch(frame);
+    const encoded =
+      contacts.length === 0 ? "-" : contacts.map((c) => `${c.id},${c.x},${c.y}`).join("+");
+    if (frame === 0 || encoded !== previous) {
+      entries.push(`${frame}:${encoded}`);
+      previous = encoded;
+    }
+  }
+  return entries.length === 1 && entries[0] === "0:-" ? "" : entries.join(";");
+}
+
+/** Packed contacts (touch.ts wire words) for one frame, or undefined. */
+export function packedTouchFor(spec: GoldenSpec, frame: number): number[] | undefined {
+  const contacts = spec.touch?.(frame);
+  if (!contacts || contacts.length === 0) return undefined;
+  return contacts.map(
+    (c) => (((c.id & 0xff) << 18) | ((c.y & 0x1ff) << 9) | (c.x & 0x1ff)) >>> 0,
+  );
 }

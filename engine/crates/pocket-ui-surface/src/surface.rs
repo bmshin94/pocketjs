@@ -5,7 +5,10 @@
 //! Boot contract mirrors the PSP host (`hosts/psp/src/ffi.rs` + `pak.rs`):
 //! styles/atlases feed the core natively BEFORE the bundle evals, pak images
 //! and sprites upload natively, and the (name → handle) tables are exposed
-//! as `ui.__textures` / `ui.__sprites`, which is exactly what routes
+//! as `ui.__textures` / `ui.__sprites`. Pocket System shells additionally get
+//! a separate `ui.__surfaces` package-id table from the native compositor; surface
+//! handles never enter the texture table.
+//! This is exactly what routes
 //! `framework/src/host.ts::detectHost` onto its PSP branch. One desktop addition:
 //! `ui.__viewport = {w, h}` tells the framework the logical UI size (the PSP
 //! host omits it and the framework defaults to 480x272).
@@ -16,11 +19,41 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use pocket_mod::Guest;
-use pocket_mod::qjs::{Coerced, Function, Object, TypedArray};
+use pocket_mod::qjs::{Coerced, Ctx, FromJs, Function, Object, TypedArray, Value};
 use pocketjs_core::Ui;
 
 use crate::dbg::DbgMailbox;
 use crate::pak::walk_pak;
+
+/// A JS string decoded tolerantly for host ops. JS strings are potentially
+/// ill-formed UTF-16 — an app slicing between surrogate halves is legal JS
+/// (note's wrap math measuring an emoji prefix, say) — and QuickJS hands
+/// lone surrogates to the FFI as bytes that are not valid UTF-8, which the
+/// strict conversion turns into a thrown guest frame. A host op must never
+/// abort the frame transaction over a legal JS value, so every string op
+/// decodes lossy: each lone surrogate reads as U+FFFD.
+struct LossyString(String);
+
+impl<'js> FromJs<'js> for LossyString {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> pocket_mod::qjs::Result<LossyString> {
+        // The strict coercion first: it handles non-strings (Solid passes
+        // numbers through replaceText) and every well-formed string.
+        match Coerced::<String>::from_js(ctx, value.clone()) {
+            Ok(s) => Ok(LossyString(s.0)),
+            Err(_) => {
+                let js = value
+                    .into_string()
+                    .ok_or_else(|| pocket_mod::qjs::Error::new_from_js("value", "string"))?;
+                let c = js.to_cstring()?;
+                // CString::as_str assumes valid UTF-8, which lone
+                // surrogates break — read the raw bytes instead.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u8, c.len()) };
+                Ok(LossyString(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        }
+    }
+}
 
 /// One sprite-atlas registration from the pak (`ui.__sprites[name]`).
 struct SpriteReg {
@@ -39,15 +72,18 @@ struct Inner {
     /// pak image name → core texture handle (`ui.__textures`).
     textures: Vec<(String, i32)>,
     sprites: Vec<SpriteReg>,
+    /// Installed Pocket System package id -> native compositor surface handle.
+    surfaces: Vec<(String, i32)>,
     /// Host service channel (spec ops 30..32): in-process JSON-line queues.
     /// On consoles the mailbox is files under a tethered share; here the
     /// widget host *is* the companion process, so lines just cross a queue.
     svc_in: VecDeque<String>,
     svc_out: VecDeque<String>,
-    /// Companion service names accepted by `svcOpen`. `None` preserves the
-    /// historical desktop-host default of accepting any name; a Stage sets an
-    /// exact package-authored allowlist (which may be empty).
-    svc_allowlist: Option<Vec<String>>,
+    /// Companion service names accepted by `svcOpen`. Deny-all by default —
+    /// svcOpen must answer TRUTHFULLY, and a host that serves a companion
+    /// declares it explicitly (an implicit allow-any default let apps
+    /// believe in adapters nobody feeds).
+    svc_allowlist: Vec<String>,
     /// Platform-contract identity published as `ui.__host`/`ui.__hostAbi`.
     /// Bundles built from a resolved plan refuse hosts whose identity does
     /// not match their target (framework/src/host.ts assertNativeHostContract).
@@ -82,9 +118,10 @@ impl UiSurface {
                 pak: Vec::new(),
                 textures: Vec::new(),
                 sprites: Vec::new(),
+                surfaces: Vec::new(),
                 svc_in: VecDeque::new(),
                 svc_out: VecDeque::new(),
-                svc_allowlist: None,
+                svc_allowlist: Vec::new(),
                 host_id: "desktop".into(),
                 host_abi: None,
             })),
@@ -100,20 +137,17 @@ impl UiSurface {
         inner.host_abi = Some(host_abi);
     }
 
-    /// Restrict `svcOpen` to exact companion service names. An empty list
-    /// advertises no service. Call this before `mount`, which installs the
-    /// host-op closure into the guest.
+    /// Declare the exact companion service names this host serves (svcOpen
+    /// answers false for everything else — and for everything, by default).
+    /// Call this before `mount`, which installs the host-op closure into
+    /// the guest.
     pub fn set_svc_allowlist<I, S>(&self, services: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.inner.borrow_mut().svc_allowlist = Some(
-            services
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<String>>(),
-        );
+        self.inner.borrow_mut().svc_allowlist =
+            services.into_iter().map(Into::into).collect::<Vec<String>>();
     }
 
     /// Queue one JSON line for the guest's next `svcPoll` (host → guest).
@@ -208,10 +242,46 @@ impl UiSurface {
         }
     }
 
+    /// Register an installed Pocket System package before [`mount`](Self::mount).
+    /// Handles live in the compositor namespace and are never valid textures.
+    pub fn register_compositor_surface(&self, package: impl Into<String>) -> Option<i32> {
+        let mut inner = self.inner.borrow_mut();
+        let package = package.into();
+        if let Some((_, handle)) = inner.surfaces.iter().find(|(known, _)| known == &package) {
+            return Some(*handle);
+        }
+        let handle = i32::try_from(inner.surfaces.len()).ok()?;
+        inner.surfaces.push((package, handle));
+        Some(handle)
+    }
+
+    /// Declare how many ticks make one second of virtual time (default 60).
+    /// Call before `mount`: the mount publishes the rate to the guest as
+    /// `ui.__tickHz`, and bundles refuse a rate other than the one they were
+    /// built for. Rejected once the core has ticked (see `Ui::set_tick_rate`);
+    /// returns whether the rate was applied.
+    pub fn set_tick_rate(&self, hz: u32) -> bool {
+        self.inner.borrow_mut().ui.set_tick_rate(hz)
+    }
+
     /// Advance the core one fixed-dt frame (call once per host tick, after
     /// the guest turn, before rendering).
     pub fn tick(&self) {
         self.inner.borrow_mut().ui.tick();
+    }
+
+    /// Install a native text measurer (docs/BACKENDS.md). Call before
+    /// `mount`, like `set_tick_rate`: measurement feeds layout, so the guest
+    /// must never observe a provider swap mid-run.
+    pub fn set_text_measure(&self, f: pocketjs_core::text::MeasureFn) {
+        self.inner.borrow_mut().ui.set_text_measure(Some(f));
+    }
+
+    /// Install a native line wrapper next to the measurer (OP wrapText —
+    /// break positions then come from the host text system). Same call-
+    /// before-`mount` rule so the guest never observes a provider swap.
+    pub fn set_text_wrap(&self, f: pocketjs_core::text::WrapFn) {
+        self.inner.borrow_mut().ui.set_text_wrap(Some(f));
     }
 
     /// Borrow the core (the renderer reads the DrawList/textures/atlases
@@ -267,13 +337,13 @@ impl UiSurface {
             // Text ops coerce like the PSP FFI does (JS_ToCString semantics —
             // Solid legitimately passes numbers through replaceText).
             let ui = self.inner.clone();
-            op!("setText", move |id: i32, s: Coerced<String>| ui
+            op!("setText", move |id: i32, s: LossyString| ui
                 .borrow_mut()
                 .ui
                 .set_text(id, &s.0));
 
             let ui = self.inner.clone();
-            op!("replaceText", move |id: i32, s: Coerced<String>| {
+            op!("replaceText", move |id: i32, s: LossyString| {
                 ui.borrow_mut().ui.replace_text(id, &s.0)
             });
 
@@ -295,6 +365,13 @@ impl UiSurface {
                 .borrow_mut()
                 .ui
                 .set_image(id, tex));
+
+            let ui = self.inner.clone();
+            op!("setCompositorSurface", move |id: i32, surface: i32, focused: i32| {
+                ui.borrow_mut()
+                    .ui
+                    .set_compositor_surface(id, surface, focused != 0)
+            });
 
             let ui = self.inner.clone();
             op!("setSprite", move |id: i32,
@@ -348,6 +425,13 @@ impl UiSurface {
                 ui.borrow_mut().ui.hit_test(x as f32, y as f32)
             });
 
+            // Touch-path hit authority (spec op 42): the gesture layer
+            // prefers the bounds hit over the ink-claiming hitTest above.
+            let ui = self.inner.clone();
+            op!("hitTestBounds", move |x: f64, y: f64| {
+                ui.borrow_mut().ui.hit_test_bounds(x as f32, y as f32)
+            });
+
             let ui = self.inner.clone();
             op!("setCursor", move |tex: i32, hot_x: f64, hot_y: f64, w: f64, h: f64| {
                 ui.borrow_mut().ui.set_cursor(tex, hot_x as f32, hot_y as f32, w as f32, h as f32)
@@ -375,13 +459,21 @@ impl UiSurface {
             });
 
             let ui = self.inner.clone();
-            op!("measureText", move |s: Coerced<String>, slot: i32| {
+            op!("measureText", move |s: LossyString, slot: i32| {
                 ui.borrow_mut().ui.measure_text(&s.0, slot as u8) as f64
             });
 
+            let ui = self.inner.clone();
+            op!(
+                "wrapText",
+                move |s: LossyString, slot: i32, max_w: f64| -> Vec<u32> {
+                    ui.borrow_mut().ui.wrap_text(&s.0, slot as u8, max_w as f32)
+                }
+            );
+
             // ---- streamed textures (spec ops 23..25) ---------------------
             let ui = self.inner.clone();
-            op!("loadTileTexture", move |key: Coerced<String>, index: i32| {
+            op!("loadTileTexture", move |key: LossyString, index: i32| {
                 if index < 0 {
                     return -1;
                 }
@@ -442,7 +534,7 @@ impl UiSurface {
             });
 
             let m = mbox;
-            op!("__dbgSend", move |line: Coerced<String>| {
+            op!("__dbgSend", move |line: LossyString| {
                 if let Some(b) = m.borrow().as_ref() {
                     b.send(&line.0);
                 }
@@ -453,12 +545,9 @@ impl UiSurface {
             // provides one. Lines cross an in-process queue instead of a
             // tethered share; apps feature-detect exactly like on PSP.
             let ui = self.inner.clone();
-            op!("svcOpen", move |app: Coerced<String>| {
+            op!("svcOpen", move |app: LossyString| {
                 let inner = ui.borrow();
-                match &inner.svc_allowlist {
-                    None => true,
-                    Some(names) => names.iter().any(|name| name == &app.0),
-                }
+                inner.svc_allowlist.iter().any(|name| name == &app.0)
             });
 
             let ui = self.inner.clone();
@@ -478,7 +567,7 @@ impl UiSurface {
             });
 
             let ui = self.inner.clone();
-            op!("svcSend", move |line: Coerced<String>| {
+            op!("svcSend", move |line: LossyString| {
                 ui.borrow_mut().svc_out.push_back(line.0);
             });
 
@@ -501,6 +590,12 @@ impl UiSurface {
             }
             ns.set("__sprites", sprites)?;
 
+            let surfaces = Object::new(ctx.clone())?;
+            for (package, handle) in &inner.surfaces {
+                surfaces.set(package.as_str(), *handle)?;
+            }
+            ns.set("__surfaces", surfaces)?;
+
             let (vw, vh) = inner.ui.viewport();
             let viewport = Object::new(ctx.clone())?;
             viewport.set("w", vw as f64)?;
@@ -514,6 +609,10 @@ impl UiSurface {
             if let Some(abi) = inner.host_abi {
                 ns.set("__hostAbi", abi)?;
             }
+            // The realm's declared tick rate. Bundles bake theirs the way
+            // glyphs bake density, and refuse a host running another —
+            // which is why set_tick_rate must precede mount.
+            ns.set("__tickHz", inner.ui.tick_rate())?;
 
             Ok(())
         })
@@ -538,6 +637,21 @@ fn decode_pix_header(blob: &[u8], pixels_off: usize) -> Option<(u32, u32, u32, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svc_open_denies_by_default() {
+        // Truthful-by-default: a host that never declares a companion must
+        // answer false — apps otherwise enable UI over a channel nobody
+        // feeds (the macos-app --editor regression, review round 3).
+        let guest = Guest::new().unwrap();
+        let surface = UiSurface::new((16.0, 16.0));
+        surface.mount(&guest).unwrap();
+        guest
+            .eval("service", "globalThis.serviceOpen = ui.svcOpen('note');")
+            .unwrap();
+        let open: bool = guest.with(|ctx| ctx.globals().get("serviceOpen").unwrap());
+        assert!(!open);
+    }
 
     #[test]
     fn empty_service_allowlist_disables_the_companion() {
@@ -592,5 +706,33 @@ mod tests {
             vec!["media"]
         );
         assert_eq!(surface.svc_drain(), vec!["alpha", "omega"]);
+    }
+
+    #[test]
+    fn compositor_surface_has_its_own_namespace_and_core_binding() {
+        let guest = Guest::new().unwrap();
+        let surface = UiSurface::new((16.0, 16.0));
+        let handle = surface
+            .register_compositor_surface("dev.pocket-stack.hero")
+            .unwrap();
+        assert_eq!(
+            surface.register_compositor_surface("dev.pocket-stack.hero"),
+            Some(handle)
+        );
+        surface.mount(&guest).unwrap();
+        guest
+            .eval(
+                "surface",
+                "globalThis.surface = ui.__surfaces['dev.pocket-stack.hero'];\
+                 globalThis.node = ui.createNode(3);\
+                 ui.setCompositorSurface(globalThis.node, globalThis.surface, 1);",
+            )
+            .unwrap();
+        let published: i32 = guest.with(|ctx| ctx.globals().get("surface").unwrap());
+        assert_eq!(published, handle);
+        surface.with_ui(|ui| {
+            assert!(ui.texture(handle).is_none());
+            assert_eq!(ui.compositor_surface_bindings(), vec![(handle as u32, true)]);
+        });
     }
 }

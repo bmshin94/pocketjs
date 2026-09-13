@@ -18,6 +18,7 @@
 
 import ts from "typescript";
 import { FONT8 } from "./font.gen.ts";
+import { sccpRefConstants } from "./sccp.ts";
 import { rgb555, rgb565, StyleTable, type StyleIssue } from "./styles.ts";
 import { BACKDROP } from "./styles.ts";
 
@@ -32,7 +33,7 @@ export interface DebugSlot {
   kind: "num" | "bool" | "str" | "listLen";
 }
 
-export type VaporTargetName = "gba" | "gb" | "nes" | "esp32";
+export type VaporTargetName = "gba" | "gb" | "nes" | "esp32" | "playdate";
 
 export interface VaporTarget {
   name: VaporTargetName;
@@ -51,6 +52,18 @@ export const VAPOR_TARGETS: Record<VaporTargetName, VaporTarget> = {
   gb: { name: "gb", width: 20, height: 18, poolCap: 32, strCap: 24 },
   nes: { name: "nes", width: 22, height: 18, poolCap: 8, strCap: 20 },
   esp32: { name: "esp32", width: 20, height: 18, poolCap: 32, strCap: 24 },
+  playdate: { name: "playdate", width: 50, height: 30, poolCap: 32, strCap: 24 },
+};
+
+const BUTTON_NAMES = ["A", "B", "Select", "Start", "Right", "Left", "Up", "Down", "R", "L"] as const;
+const PLAYDATE_BUTTONS = new Set([0, 1, 4, 5, 6, 7]);
+const RELATIVE_AXIS_NAMES = ["Primary", "Secondary"] as const;
+const TARGET_RELATIVE_AXES: Record<VaporTargetName, readonly number[]> = {
+  gba: [],
+  gb: [],
+  nes: [],
+  esp32: [],
+  playdate: [0],
 };
 
 export interface CompiledApp {
@@ -67,6 +80,8 @@ export interface CompiledApp {
    * folded Button.X reads) — the input half of the app's derived demands.
    * Per target: code behind a false SCREEN fold is never compiled. */
   buttonsUsed: number[];
+  /** Relative axes statically registered through onAxisDelta(). */
+  relativeAxesUsed: number[];
 }
 
 export class VaporCompileError extends Error {
@@ -193,7 +208,29 @@ export function compileVaporApp(
   options: CompileOptions = {},
 ): CompiledApp {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TSX);
-  return new AppCompiler(sf, title, VAPOR_TARGETS[targetName], options).compile();
+  const app = new AppCompiler(sf, title, VAPOR_TARGETS[targetName], options).compile();
+  if (targetName === "playdate") {
+    const unsupported = app.buttonsUsed.filter((button) => !PLAYDATE_BUTTONS.has(button));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `${fileName} — VT101: playdate has no physical input for ${unsupported
+          .map((button) => BUTTON_NAMES[button] ?? `button ${button}`)
+          .join(", ")}; supported buttons are A, B, Right, Left, Up, Down`,
+      );
+    }
+  }
+  const supportedAxes = new Set(TARGET_RELATIVE_AXES[targetName]);
+  const unsupportedAxes = app.relativeAxesUsed.filter((axis) => !supportedAxes.has(axis));
+  if (unsupportedAxes.length > 0) {
+    throw new Error(
+      `${fileName} — VT102: ${targetName} has no adapter for relative axis ${unsupportedAxes
+        .map((axis) => RELATIVE_AXIS_NAMES[axis] ?? String(axis))
+        .join(", ")}; supported relative axes are ${
+        [...supportedAxes].map((axis) => RELATIVE_AXIS_NAMES[axis] ?? String(axis)).join(", ") || "none"
+      }`,
+    );
+  }
+  return app;
 }
 
 class AppCompiler {
@@ -203,12 +240,14 @@ class AppCompiler {
   private computeds: ComputedBinding[] = [];
   private fns: FnBinding[] = [];
   private handler: ts.ArrowFunction | null = null;
+  private axisHandlers = new Map<number, ts.ArrowFunction>();
   private template: ts.JsxFragment | null = null;
 
   private vueRef = "";
   private vueComputed = "";
   private hostOnButton = "";
   private hostButton = "";
+  private hostOnAxisDelta = "";
 
   // emission
   private decls: string[] = [];
@@ -221,6 +260,100 @@ class AppCompiler {
   private styleTable = new StyleTable();
   private styleErrors: string[] = [];
   private styleWarnings: string[] = [];
+
+  /** SCCP result: refs proven constant (name -> value). Reads of these fold
+   * through constNum, so they never register dependencies and decidable
+   * ternary/if branches drop their dead arm from masks and ROM alike. */
+  private sccpFolded: Map<string, number> | null = null;
+
+  // ---- overlay allocation of frame-local temporaries -----------------------
+  // Materialized view chains and string scratch used to be either permanent
+  // statics (a `vt` lives forever for one call's worth of work) or C-stack
+  // locals (21-33 B frames on the cc65/sdcc software stack). Both are wrong
+  // for the 8-bit targets: statics never share, stack frames cost code and
+  // cycles on every access. Instead every temporary is tagged with the
+  // generated function that owns it; two temporaries may share one static
+  // slot unless their owners can be live at the same time — same owner, or
+  // one owner reachable from the other in the static call graph (helpers,
+  // computed accessors, keymap actions). The subset forbids recursion and
+  // nothing runs from interrupts, so reachability is the whole story.
+  // Placeholders are substituted with colored slot names at emit time.
+  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string }[] = [];
+  private ovlEdges = new Map<string, Set<string>>(); // caller -> callees
+  private ovlOwnerStack: string[] = [];
+  private unitCounter = 0;
+
+  private ovlOwner(): string {
+    return this.ovlOwnerStack[this.ovlOwnerStack.length - 1] ?? "app_init";
+  }
+
+  private withOwner<T>(owner: string, build: () => T): T {
+    this.ovlOwnerStack.push(owner);
+    try {
+      return build();
+    } finally {
+      this.ovlOwnerStack.pop();
+    }
+  }
+
+  private allocTemp(kind: "view" | "sb"): string {
+    const id = this.ovlTemps.length;
+    this.ovlTemps.push({ id, kind, owner: this.ovlOwner() });
+    return `@OVL${id}@`;
+  }
+
+  private ovlCall(callee: string): void {
+    const caller = this.ovlOwner();
+    if (caller === callee) return;
+    let set = this.ovlEdges.get(caller);
+    if (!set) this.ovlEdges.set(caller, (set = new Set()));
+    set.add(callee);
+  }
+
+  /** Color temporaries into shared static slots; returns decls + name map. */
+  private ovlAssign(): { decls: string[]; names: Map<number, string>; slotBytes: number } {
+    // transitive reachability over owners
+    const reach = new Map<string, Set<string>>();
+    const reaches = (from: string, to: string): boolean => {
+      let r = reach.get(from);
+      if (!r) {
+        r = new Set();
+        reach.set(from, r);
+        const walk = (o: string) => {
+          for (const callee of this.ovlEdges.get(o) ?? []) {
+            if (!r!.has(callee)) {
+              r!.add(callee);
+              walk(callee);
+            }
+          }
+        };
+        walk(from);
+      }
+      return r.has(to);
+    };
+    const interferes = (a: { owner: string }, b: { owner: string }): boolean =>
+      a.owner === b.owner || reaches(a.owner, b.owner) || reaches(b.owner, a.owner);
+
+    const names = new Map<number, string>();
+    const decls: string[] = [];
+    let slotBytes = 0;
+    for (const kind of ["view", "sb"] as const) {
+      const temps = this.ovlTemps.filter((t) => t.kind === kind);
+      const slots: { name: string; members: { owner: string }[] }[] = [];
+      for (const t of temps) {
+        let slot = slots.find((s) => s.members.every((m) => !interferes(t, m)));
+        if (!slot) {
+          slot = { name: `ovl_${kind}${slots.length}`, members: [] };
+          slots.push(slot);
+          decls.push(`static ${kind === "view" ? "vp_view" : "vp_sb"} ${slot.name};`);
+          slotBytes += kind === "view" ? 1 + this.target.poolCap : 1 + this.target.strCap;
+        }
+        slot.members.push(t);
+        names.set(t.id, slot.name);
+      }
+    }
+    return { decls, names, slotBytes };
+  }
 
   constructor(
     private sf: ts.SourceFile,
@@ -260,6 +393,14 @@ class AppCompiler {
     }
     if (!component) this.err(this.sf, "missing `export default () => ...` component");
     if (!this.vueRef || !this.vueComputed) this.err(this.sf, 'component must import { ref, computed } from "vue"');
+    // SCCP runs before setup analysis so computed/effect dep collection sees
+    // folded ref reads. foldConst here is module-level only: sccpFolded is
+    // still null, so constNum cannot consult the result being computed.
+    this.sccpFolded = sccpRefConstants({
+      component,
+      refLocalName: this.vueRef,
+      foldConst: (e) => this.constNum(e) ?? this.constBool(e),
+    });
     this.scanSetup(component);
     return this.emit();
   }
@@ -278,6 +419,19 @@ class AppCompiler {
       } else if (/\/host\/input(\.ts)?$/.test(from)) {
         if (imported === "onButton") this.hostOnButton = local;
         else if (imported === "Button") this.hostButton = local;
+        else if (imported === "onAxisDelta") this.hostOnAxisDelta = local;
+        else if (imported === "RelativeAxis")
+          this.scope.set(local, {
+            kind: "const",
+            name: local,
+            value: { Primary: 0, Secondary: 1 },
+          });
+        else if (imported === "RelativeAxisUnits")
+          this.scope.set(local, {
+            kind: "const",
+            name: local,
+            value: { PerDegree: 1000, PerTurn: 360000 },
+          });
         else this.err(spec, `unsupported host import: ${imported}`);
       } else if (/\/host\/screen(\.ts)?$/.test(from)) {
         if (imported !== "SCREEN") this.err(spec, `unsupported host import: ${imported}`);
@@ -370,6 +524,24 @@ class AppCompiler {
           const arg = call.arguments[0];
           if (!arg || !ts.isArrowFunction(arg)) this.err(call, "onButton takes an arrow");
           this.handler = arg;
+        } else if (
+          ts.isCallExpression(call) &&
+          ts.isIdentifier(call.expression) &&
+          call.expression.text === this.hostOnAxisDelta
+        ) {
+          const axisNode = call.arguments[0];
+          const handler = call.arguments[1];
+          if (!axisNode) this.err(call, "onAxisDelta requires a relative axis");
+          const axis = this.constNum(axisNode);
+          if (axis === null || axis < 0 || axis >= RELATIVE_AXIS_NAMES.length)
+            this.err(axisNode, "onAxisDelta axis must be a compile-time RelativeAxis constant");
+          if (!handler || !ts.isArrowFunction(handler))
+            this.err(call, "onAxisDelta takes an axis and an arrow");
+          if (handler.parameters.length !== 1)
+            this.err(handler, "onAxisDelta arrow needs exactly one delta parameter");
+          if (this.axisHandlers.has(axis))
+            this.err(axisNode, `only one onAxisDelta handler is supported for ${RELATIVE_AXIS_NAMES[axis]}`);
+          this.axisHandlers.set(axis, handler);
         } else this.err(stmt, "unsupported setup statement");
       } else if (ts.isReturnStatement(stmt)) {
         if (!stmt.expression) this.err(stmt, "component must return JSX");
@@ -568,13 +740,13 @@ class AppCompiler {
 
   private compileActionArrow(cName: string, arrow: ts.ArrowFunction): void {
     const saved = new Map(this.scope);
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(cName, () => this.withHoist((out) => {
       if (ts.isBlock(arrow.body)) {
         for (const stmt of arrow.body.statements) this.compileStmt(stmt, out, "  ");
       } else {
         this.compileExprStmt(arrow.body, out, "  ");
       }
-    });
+    }));
     this.scope = saved;
     this.bodies.push(`static void ${cName}(void) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
@@ -584,7 +756,10 @@ class AppCompiler {
     e = this.unparen(e);
     if (ts.isIdentifier(e)) {
       const b = this.scope.get(e.text);
-      return b?.kind === "keymap" ? `KM_${b.name}` : null;
+      if (b?.kind !== "keymap") return null;
+      // indirect dispatch: the caller may enter any action in this table
+      for (const cName of b.entries.values()) this.ovlCall(cName);
+      return `KM_${b.name}`;
     }
     if (ts.isConditionalExpression(e)) {
       const a = this.compileKeymapExpr(e.whenTrue, out, ind);
@@ -644,7 +819,7 @@ class AppCompiler {
 
     const index = this.computeds.length;
     let binding!: ComputedBinding;
-    const hoisted = this.withHoist((lines) => {
+    const hoisted = this.withOwner(`c_${name}_update`, () => this.withHoist((lines) => {
     if (this.isViewExpr(body)) {
       const maxLen = this.viewMaxLen(body);
       binding = { kind: "computed", name, index, valTy: this.viewTyOf(body), deps, maxLen };
@@ -663,7 +838,7 @@ class AppCompiler {
       };
       lines.push(`  c_${name}_v = ${val.c};`);
     }
-    });
+    }));
     const lines = [...hoisted.decls, ...hoisted.body];
     this.curDeps = prevDeps;
 
@@ -752,8 +927,11 @@ class AppCompiler {
 
   private viewMaxLen(e: ts.Expression): number {
     e = this.unparen(e);
-    if (ts.isConditionalExpression(e))
+    if (ts.isConditionalExpression(e)) {
+      const cf = this.constNum(e.condition) ?? this.constBool(e.condition);
+      if (cf !== null) return this.viewMaxLen(cf ? e.whenTrue : e.whenFalse);
       return Math.max(this.viewMaxLen(e.whenTrue), this.viewMaxLen(e.whenFalse));
+    }
     if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression)) {
       const inner = this.viewMaxLen(e.expression.expression);
       if (e.expression.name.text === "filter") return inner;
@@ -771,15 +949,30 @@ class AppCompiler {
     return this.target.poolCap;
   }
 
-  /** Comparisons over compile-time numbers fold to 0/1 (SCREEN.width < 30). */
+  /** Comparisons over compile-time numbers fold to 0/1 (SCREEN.width < 30),
+   * plus !x and short-circuit &&/|| over foldable operands — SCCP-folded
+   * ref reads arrive through constNum, so `!locked.value` folds too. */
   private constBool(e: ts.Expression): number | null {
     e = this.unparen(e);
+    const K = ts.SyntaxKind;
+    if (ts.isPrefixUnaryExpression(e) && e.operator === K.ExclamationToken) {
+      const v = this.constNum(e.operand) ?? this.constBool(e.operand);
+      return v === null ? null : v ? 0 : 1;
+    }
     if (!ts.isBinaryExpression(e)) return null;
+    const op = e.operatorToken.kind;
+    if (op === K.AmpersandAmpersandToken || op === K.BarBarToken) {
+      const l = this.constNum(e.left) ?? this.constBool(e.left);
+      if (l === null) return null; // short-circuit needs a decided left
+      if (op === K.AmpersandAmpersandToken && !l) return 0;
+      if (op === K.BarBarToken && l) return 1;
+      const r = this.constNum(e.right) ?? this.constBool(e.right);
+      return r === null ? null : r ? 1 : 0;
+    }
     const l = this.constNum(e.left);
     const r = this.constNum(e.right);
     if (l === null || r === null) return null;
-    const K = ts.SyntaxKind;
-    switch (e.operatorToken.kind) {
+    switch (op) {
       case K.LessThanToken: return l < r ? 1 : 0;
       case K.GreaterThanToken: return l > r ? 1 : 0;
       case K.LessThanEqualsToken: return l <= r ? 1 : 0;
@@ -806,6 +999,19 @@ class AppCompiler {
     const sub = this.substProp(e);
     if (sub) return this.constNum(sub);
     if (ts.isNumericLiteral(e)) return Number(e.text);
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken) {
+      const v = this.constNum(e.operand);
+      return v === null ? null : -v;
+    }
+    // SCCP-folded ref reads: `flag.value` where flag is proven constant.
+    // Scope check keeps shadowing locals (map/filter params) out.
+    {
+      const base = this.valueBase(e);
+      if (base !== null && this.sccpFolded?.has(base)) {
+        const b = this.scope.get(base);
+        if (!b || b.kind === "ref") return this.sccpFolded.get(base)!;
+      }
+    }
     if (ts.isIdentifier(e)) {
       const b = this.scope.get(e.text);
       if (b?.kind === "const" && typeof b.value === "number") return b.value;
@@ -849,8 +1055,13 @@ class AppCompiler {
   private compileViewInto(e: ts.Expression, target: string, out: string[], ind: string): void {
     e = this.unparen(e);
     if (ts.isConditionalExpression(e)) {
+      const cf = this.constNum(e.condition) ?? this.constBool(e.condition);
+      if (cf !== null) {
+        this.compileViewInto(cf ? e.whenTrue : e.whenFalse, target, out, ind);
+        return;
+      }
       const cond = this.compileExpr(e.condition, out, ind);
-      out.push(`${ind}if (${this.truthy(cond)}) {`);
+      out.push(`${ind}if (${this.condition(cond)}) {`);
       this.compileViewInto(e.whenTrue, target, out, ind + "  ");
       out.push(`${ind}} else {`);
       this.compileViewInto(e.whenFalse, target, out, ind + "  ");
@@ -877,7 +1088,7 @@ class AppCompiler {
         this.scope.set(param, { kind: "local", cName: p, ty: { k: "obj", iface, listRef } });
         const pred = this.compileExpr(arrow.body, out, ind + "    ");
         this.scope = saved;
-        out.push(`${ind}    if (${this.truthy(pred)}) ${target}.idx[${target}.len++] = ${src.at(i)};`);
+        out.push(`${ind}    if (${this.condition(pred)}) ${target}.idx[${target}.len++] = ${src.at(i)};`);
         out.push(`${ind}  }`);
         out.push(`${ind}}`);
         return;
@@ -923,16 +1134,16 @@ class AppCompiler {
       }
       if (b?.kind === "computed" && b.valTy.k === "view") {
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`c_${b.name}_update`);
         const v = this.tmp("v");
         this.declare(`const vp_view *${v};`);
         out.push(`${ind}${v} = c_${b.name}();`);
         return { len: `${v}->len`, at: (i) => `${v}->idx[${i}]` };
       }
     }
-    // nested filter/slice chain: materialize into a temp view
+    // nested filter/slice chain: materialize into an overlay temp view
     if (ts.isCallExpression(e)) {
-      const v = this.tmp("vt");
-      this.decls.push(`static vp_view ${v};`);
+      const v = this.allocTemp("view");
       this.compileViewInto(e, v, out, ind);
       return { len: `${v}.len`, at: (i) => `${v}.idx[${i}]` };
     }
@@ -942,6 +1153,14 @@ class AppCompiler {
   private truthy(v: { c: string; ty: Ty }): string {
     if (v.ty.k === "obj") return `(${v.c} != 0)`;
     return v.c;
+  }
+
+  /** C control-flow syntax already supplies the outer parentheses. */
+  private condition(v: { c: string; ty: Ty }): string {
+    const c = this.truthy(v);
+    return v.ty.k === "bool" && c.startsWith("(") && c.endsWith(")")
+      ? c.slice(1, -1)
+      : c;
   }
 
   // ---- scalar expression compilation ---------------------------------------
@@ -983,6 +1202,7 @@ class AppCompiler {
       }
       if (b?.kind === "computed") {
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`c_${base}_update`);
         if (b.valTy.k === "num") return { c: `c_${base}()`, ty: NUM };
         if (b.valTy.k === "obj") return { c: `c_${base}()`, ty: b.valTy };
         this.err(e, "view computeds can only be used through list operations");
@@ -1091,7 +1311,8 @@ class AppCompiler {
 
   private compileCall(e: ts.CallExpression, out: string[], ind: string): { c: string; ty: Ty } {
     const callee = this.unparen(e.expression);
-    // Math.min/max
+    // Integer-safe Math subset. Every compiled NUM is s32, so Math.trunc is
+    // an identity after C integer division while preserving Vue-oracle parity.
     if (
       ts.isPropertyAccessExpression(callee) &&
       ts.isIdentifier(callee.expression) &&
@@ -1100,6 +1321,10 @@ class AppCompiler {
       const args = e.arguments.map((a) => this.compileExpr(a, out, ind).c);
       if (callee.name.text === "max") return { c: `vp_max(${args.join(", ")})`, ty: NUM };
       if (callee.name.text === "min") return { c: `vp_min(${args.join(", ")})`, ty: NUM };
+      if (callee.name.text === "trunc") {
+        if (args.length !== 1) this.err(e, "Math.trunc takes exactly one argument");
+        return { c: `(${args[0]})`, ty: NUM };
+      }
       this.err(e, `unsupported Math.${callee.name.text}`);
     }
     // list.indexOf(ptr)
@@ -1123,6 +1348,7 @@ class AppCompiler {
         });
         this.emitFn(b);
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`fn_${b.name}`);
         return { c: `fn_${b.name}(${args.join(", ")})`, ty: { k: "void" } };
       }
     }
@@ -1182,7 +1408,8 @@ class AppCompiler {
       const b = e.arguments[1]
         ? this.compileExpr(e.arguments[1], out, ind)
         : { c: `(s32)(${srcV.c})->len`, ty: NUM };
-      out.push(`${ind}{ vp_sb sl; vp_sb_slice(&sl, ${srcV.c}, ${a.c}, ${b.c}); vp_sb_sb(&${sb}, &sl); }`);
+      const sl = this.allocTemp("sb");
+      out.push(`${ind}{ vp_sb_slice(&${sl}, ${srcV.c}, ${a.c}, ${b.c}); vp_sb_sb(&${sb}, &${sl}); }`);
       return;
     }
     const v = this.compileExpr(e, out, ind);
@@ -1201,8 +1428,16 @@ class AppCompiler {
       return;
     }
     if (ts.isIfStatement(stmt)) {
+      // decidable condition (SCCP-folded refs, SCREEN geometry): emit only
+      // the taken branch — the dead arm leaves ROM and the dep set entirely
+      const cf = this.constNum(stmt.expression) ?? this.constBool(stmt.expression);
+      if (cf !== null) {
+        if (cf) this.compileStmt(stmt.thenStatement, out, ind);
+        else if (stmt.elseStatement) this.compileStmt(stmt.elseStatement, out, ind);
+        return;
+      }
       const cond = this.compileExpr(stmt.expression, out, ind);
-      out.push(`${ind}if (${this.truthy(cond)}) {`);
+      out.push(`${ind}if (${this.condition(cond)}) {`);
       this.compileStmt(stmt.thenStatement, out, ind + "  ");
       if (stmt.elseStatement) {
         out.push(`${ind}} else {`);
@@ -1248,7 +1483,7 @@ class AppCompiler {
       const cond = stmt.condition ? this.compileExpr(stmt.condition, out, ind) : { c: "1", ty: BOOL };
       const incr = stmt.incrementor ? this.compileIncrement(stmt.incrementor) : "";
       out.push(`${ind}{ s32 ${cName};`);
-      out.push(`${ind}for (${cName} = ${init.c}; ${this.truthy(cond)}; ${incr}) {`);
+      out.push(`${ind}for (${cName} = ${init.c}; ${this.condition(cond)}; ${incr}) {`);
       this.compileStmt(stmt.statement, out, ind + "  ");
       out.push(`${ind}} }`);
       this.scope = saved;
@@ -1371,8 +1606,8 @@ class AppCompiler {
         return;
       }
       if (b.refTy === "str") {
-        const tmp = this.tmp("sb");
-        out.push(`${ind}{ vp_sb ${tmp}; vp_sb_reset(&${tmp});`);
+        const tmp = this.allocTemp("sb");
+        out.push(`${ind}{ vp_sb_reset(&${tmp});`);
         this.compileStringInto(rhs, tmp, out, ind + "  ");
         out.push(`${ind}  if (vp_sb_assign(&g_${b.name}, &${tmp})) ${this.markCode(b.name)};`);
         out.push(`${ind}}`);
@@ -1386,9 +1621,9 @@ class AppCompiler {
           this.err(rhs, "list refs can only be assigned a filter/slice view");
         if (this.viewListRef(this.unparen(rhs)) !== b.name)
           this.err(rhs, "list assignment must derive from the same list");
-        const nv = this.tmp("nv");
+        const nv = this.allocTemp("view");
         const k = this.tmp("k");
-        out.push(`${ind}{ vp_view ${nv}; u8 ${k};`);
+        out.push(`${ind}{ u8 ${k};`);
         this.compileViewInto(this.unparen(rhs), nv, out, ind + "  ");
         out.push(`${ind}  for (${k} = 0; ${k} < ${nv}.len; ${k}++) *(g_${b.name} + (u16)${k}) = *(g_${b.name} + (u16)(${nv}.idx[${k}]));`);
         out.push(`${ind}  g_${b.name}_len = ${nv}.len;`);
@@ -1432,8 +1667,8 @@ class AppCompiler {
       const field = iface.fields.find((f) => f.name === (propNode.name as ts.Identifier).text);
       if (!field) this.err(propNode, `no field ${propNode.name.getText(this.sf)} on ${iface.name}`);
       if (field.ty === "str") {
-        const tmp = this.tmp("sb");
-        out.push(`${ind}  { vp_sb ${tmp}; vp_sb_reset(&${tmp});`);
+        const tmp = this.allocTemp("sb");
+        out.push(`${ind}  { vp_sb_reset(&${tmp});`);
         this.compileStringInto(propNode.initializer, tmp, out, ind + "    ");
         out.push(`${ind}    vp_sb_assign(&np->${field.name}, &${tmp}); }`);
       } else {
@@ -1469,10 +1704,10 @@ class AppCompiler {
     const prevDeps = this.curDeps;
     this.curDeps = b.deps;
     const saved = new Map(this.scope);
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(`fn_${b.name}`, () => this.withHoist((out) => {
       for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
       for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
-    });
+    }));
     this.scope = saved;
     this.curDeps = prevDeps;
     const sig = b.params.length ? b.params.map((p) => `s32 p_${p}`).join(", ") : "void";
@@ -1729,9 +1964,13 @@ class AppCompiler {
     const deps = new Set<string>();
     const prev = this.curDeps;
     this.curDeps = deps;
-    const { decls, body } = this.withHoist((out) => {
-      this.compileRowPaint(src, String(y), out, "  ");
-    });
+    // each unit is its own overlay owner: merged units run sequentially
+    // inside one effect, so their temps may share slots
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () =>
+      this.withHoist((out) => {
+        this.compileRowPaint(src, String(y), out, "  ");
+      }),
+    );
     this.curDeps = prev;
     this.propsCtx = prevCtx;
     return { span: [y, y + 1], deps, decls, body, isStatic: deps.size === 0 };
@@ -1750,21 +1989,28 @@ class AppCompiler {
       e.whenFalse.kind !== ts.SyntaxKind.NullKeyword
     )
       this.err(e, "conditional children must be {cond ? <row/> : null}");
+    // decidable condition: the row is unconditionally present (a plain row
+    // unit, static if its paint has no deps) or not present at all
+    const cf = this.constNum(e.condition) ?? this.constBool(e.condition);
+    if (cf !== null) {
+      if (cf) return this.compileRowUnit(whenTrue);
+      return { span: [0, 0], deps: new Set(), decls: [], body: [], isStatic: true };
+    }
     const deps = new Set<string>();
     const prev = this.curDeps;
     this.curDeps = deps;
     let y = 0;
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () => this.withHoist((out) => {
       const cond = this.compileExpr(e.condition, out, "  ");
       const { src, ctx } = this.resolveRenderable(whenTrue);
       const prevCtx = this.propsCtx;
       this.propsCtx = ctx ?? prevCtx;
       y = this.rowConstY(src);
-      out.push(`  if (${this.truthy(cond)}) {`);
+      out.push(`  if (${this.condition(cond)}) {`);
       this.compileRowPaint(src, String(y), out, "    ");
       out.push(`  }`);
       this.propsCtx = prevCtx;
-    });
+    }));
     this.curDeps = prev;
     return { span: [y, y + 1], deps, decls, body, isStatic: false };
   }
@@ -1791,7 +2037,7 @@ class AppCompiler {
     this.curDeps = deps;
     let yBase = 0;
     let maxLenOut = 0;
-    const { decls, body } = this.withHoist((body) => {
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () => this.withHoist((body) => {
     const src = this.viewSource(viewExpr, body, "  ");
     const listRef = this.viewListRef(viewExpr);
     const iface = this.viewIface(viewExpr);
@@ -1823,7 +2069,7 @@ class AppCompiler {
     body.push(`  } }`);
     yBase = yBaseInner;
     maxLenOut = maxLen;
-    });
+    }));
     this.curDeps = prev;
 
     const span: [number, number] = [yBase, Math.min(this.target.height, yBase + maxLenOut)];
@@ -1857,14 +2103,40 @@ class AppCompiler {
       if (!param) this.err(this.handler, "onButton arrow needs a (b) param");
       this.scope.set(param, { kind: "local", cName: "b_arg", ty: NUM });
       const handlerArrow = this.handler;
-      const { decls, body } = this.withHoist((out) => {
+      const { decls, body } = this.withOwner("app_on_button", () => this.withHoist((out) => {
         if (ts.isBlock(handlerArrow.body)) {
           for (const stmt of handlerArrow.body.statements) this.compileStmt(stmt, out, "  ");
         } else {
           this.compileExprStmt(handlerArrow.body, out, "  ");
         }
-      });
+      }));
       handlerOut = [...decls, ...body];
+      this.scope = saved;
+    }
+
+    const axisHandlerFns: string[] = [];
+    const axisHandlerCases: string[] = [];
+    for (const [axis, handler] of [...this.axisHandlers].sort(([a], [b]) => a - b)) {
+      const saved = new Map(this.scope);
+      const parameter = handler.parameters[0];
+      if (!parameter || !ts.isIdentifier(parameter.name))
+        this.err(handler, "onAxisDelta arrow needs a simple delta parameter");
+      this.scope.set(parameter.name.text, {
+        kind: "local",
+        cName: "axis_delta_arg",
+        ty: NUM,
+      });
+      const { decls, body } = this.withOwner(`vp_axis_handler_${axis}`, () => this.withHoist((out) => {
+        if (ts.isBlock(handler.body)) {
+          for (const stmt of handler.body.statements) this.compileStmt(stmt, out, "  ");
+        } else {
+          this.compileExprStmt(handler.body, out, "  ");
+        }
+      }));
+      axisHandlerFns.push(
+        `static void vp_axis_handler_${axis}(s32 axis_delta_arg) {\n${[...decls, ...body].join("\n")}\n}`,
+      );
+      axisHandlerCases.push(`    case ${axis}: vp_axis_handler_${axis}(delta); break;`);
       this.scope = saved;
     }
 
@@ -1938,6 +2210,10 @@ class AppCompiler {
       }
     }
 
+    // ---- overlay slot coloring (all bodies are emitted by now) ----
+    const ovl = this.ovlAssign();
+    if (ovl.decls.length) this.decls.push(...ovl.decls);
+
     // ---- assemble C ----
     const c: string[] = [];
     c.push("/* gen_app.c — GENERATED by vapor/compiler/compile.ts. DO NOT EDIT. */");
@@ -1948,12 +2224,17 @@ class AppCompiler {
     c.push(`#define VP_VIEW_CAP ${this.target.poolCap}`);
     c.push('#include "vapor.h"');
     c.push("");
-    c.push("static inline s32 vp_max(s32 a, s32 b) { return a > b ? a : b; }");
-    c.push("static inline s32 vp_min(s32 a, s32 b) { return a < b ? a : b; }");
+    c.push("#if defined(__GNUC__)");
+    c.push("#define VP_UNUSED_FN __attribute__((unused))");
+    c.push("#else");
+    c.push("#define VP_UNUSED_FN");
+    c.push("#endif");
+    c.push("static inline s32 VP_UNUSED_FN vp_max(s32 a, s32 b) { return a > b ? a : b; }");
+    c.push("static inline s32 VP_UNUSED_FN vp_min(s32 a, s32 b) { return a < b ? a : b; }");
     c.push(
-      "static inline const char *vp_cstr_at(const char *const *arr, s32 n, s32 i) { return (i >= 0 && i < n) ? arr[i] : (const char *)\"\"; }",
+      "static inline const char *VP_UNUSED_FN vp_cstr_at(const char *const *arr, s32 n, s32 i) { return (i >= 0 && i < n) ? arr[i] : (const char *)\"\"; }",
     );
-    c.push("static inline char vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
+    c.push("static inline char VP_UNUSED_FN vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
     c.push("");
 
     // record structs
@@ -1993,6 +2274,18 @@ class AppCompiler {
 
     // handler
     c.push(`void app_on_button(u8 b) {\n  s32 b_arg = (s32)b;\n${handlerOut.join("\n")}\n}\n`);
+    c.push(axisHandlerFns.join("\n\n"));
+    if (axisHandlerCases.length > 0) {
+      c.push(
+        `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
+          "\n",
+        )}\n    default: break;\n  }\n}\n`,
+      );
+    } else {
+      c.push(
+        "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
+      );
+    }
 
     // flush
     const flush: string[] = [];
@@ -2040,7 +2333,12 @@ class AppCompiler {
     // ---- reports ----
     const graphLines: string[] = [];
     graphLines.push("refs:");
-    for (const r of this.refs) graphLines.push(`  bit ${r.index}: ${r.name} (${r.refTy})`);
+    for (const r of this.refs) {
+      const folded = this.sccpFolded?.has(r.name)
+        ? ` = const ${this.sccpFolded.get(r.name)} (sccp: reads folded, never dirty)`
+        : "";
+      graphLines.push(`  bit ${r.index}: ${r.name} (${r.refTy})${folded}`);
+    }
     graphLines.push("computeds:");
     for (const comp of this.computeds)
       graphLines.push(
@@ -2054,6 +2352,23 @@ class AppCompiler {
           .map((r) => r.name)
           .join(", ")}}`,
       ),
+    );
+    graphLines.push("inputs:");
+    graphLines.push(
+      `  buttons: ${
+        [...this.buttonsUsed]
+          .sort((a, b) => a - b)
+          .map((button) => BUTTON_NAMES[button] ?? String(button))
+          .join(", ") || "none"
+      }`,
+    );
+    graphLines.push(
+      `  relative axes: ${
+        [...this.axisHandlers.keys()]
+          .sort((a, b) => a - b)
+          .map((axis) => RELATIVE_AXIS_NAMES[axis] ?? String(axis))
+          .join(", ") || "none"
+      }`,
     );
 
     const pools = this.refs.filter((r) => r.refTy === "list");
@@ -2070,7 +2385,8 @@ class AppCompiler {
     const romStrings =
       [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0) + this.title.length + 1;
     const pairCount = this.styleTable.pairs.length;
-    const fontBytes = this.target.name === "esp32" ? 95 * 8 : 95 * 32;
+    const fontBytes =
+      this.target.name === "esp32" || this.target.name === "playdate" ? 95 * 8 : 95 * 32;
     const styleBytes =
       this.target.name === "gba"
         ? pairCount * 16 * 2 + pairCount + 3
@@ -2079,12 +2395,13 @@ class AppCompiler {
           : pairCount;
     const planLines = [
       `state RAM: ${scalarBytes} B scalars/strings + ${poolBytes} B pools + ${viewBytes} B computed views`,
+      `overlay RAM: ${ovl.slotBytes} B in ${ovl.decls.length} shared slots (${this.ovlTemps.length} frame-local temps off the C stack)`,
       `reactive tables: ${this.refs.length} dirty bits, ${this.computeds.length} validity bits, ${effects.length} effects`,
       `ROM data: ${romStrings} B strings + ${fontBytes} B font + ${styleBytes} B style data`,
     ];
 
     return {
-      c: c.join("\n"),
+      c: c.join("\n").replace(/@OVL(\d+)@/g, (_m, id) => ovl.names.get(Number(id))!),
       title: this.title,
       graph: graphLines.join("\n"),
       plan: planLines.join("\n"),
@@ -2092,6 +2409,7 @@ class AppCompiler {
       styles: this.styleTable,
       diagnostics: this.styleWarnings,
       buttonsUsed: [...this.buttonsUsed].sort((a, b) => a - b),
+      relativeAxesUsed: [...this.axisHandlers.keys()].sort((a, b) => a - b),
     };
   }
 }
@@ -2119,8 +2437,8 @@ function emitFontGba(): string {
   return `const u8 vp_font_tiles[] = { ${bytes.join(",")} };`;
 }
 
-/** ESP32: one byte per 8-pixel row, MSB = leftmost pixel. */
-function emitFontEsp32(): string {
+/** Direct 1bpp targets: one byte per 8-pixel row, MSB = leftmost pixel. */
+function emitFont1bpp(): string {
   const bytes: number[] = [];
   for (let g = 0; g < 95; g++) bytes.push(...FONT8[g]);
   return `const u8 vp_font_tiles[] = { ${bytes.join(",")} };`;
@@ -2206,7 +2524,7 @@ function emitTargetData(target: VaporTarget, styles: StyleTable): string {
       const ink = styles.pairs.map((pair) => rgb565(pair.ink));
       const paper = styles.pairs.map((pair) => rgb565(pair.paper));
       return (
-        `${emitFontEsp32()}\n` +
+        `${emitFont1bpp()}\n` +
         `const u16 vp_ink565[] = { ${ink.join(",")} };\n` +
         `const u16 vp_paper565[] = { ${paper.join(",")} };\n` +
         `const u16 vp_backdrop = ${rgb565(BACKDROP)};\n` +
@@ -2218,5 +2536,11 @@ function emitTargetData(target: VaporTarget, styles: StyleTable): string {
     case "nes":
       /* NES font ships as CHR-ROM (rom.ts); only the style map is C data. */
       return styleTable;
+    case "playdate":
+      return (
+        `${emitFont1bpp()}\n` +
+        `const u8 vp_palette_count = ${styles.pairs.length};\n` +
+        styleTable
+      );
   }
 }

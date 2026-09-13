@@ -1,7 +1,7 @@
 // Input/focus public API.
 
 export { BTN } from "../../contracts/spec/spec.ts";
-export { touches, type TouchContact } from "./touch.ts";
+export { auxiliaryTouches, touches, type TouchContact } from "./touch.ts";
 export {
   cursorX,
   cursorY,
@@ -9,9 +9,12 @@ export {
   focusNode,
   getFocused,
   hitFocusable,
+  hitNode,
+  pressNode,
   pushFocusController,
   pushFocusGrid,
   pushFocusScope,
+  setActiveNode,
   type CursorOptions,
   type FocusDirection,
   type FocusGridOptions,

@@ -17,7 +17,6 @@ export const DOC_NAV: DocSection[] = [
       { slug: "getting-started", title: "Getting started" },
       { slug: "frameworks", title: "Frameworks" },
       { slug: "architecture", title: "Architecture" },
-      { slug: "platform-contracts", title: "Platform contracts" },
     ],
   },
   {
@@ -28,6 +27,7 @@ export const DOC_NAV: DocSection[] = [
       { slug: "reactivity", title: "Reactivity" },
       { slug: "animation", title: "Animation" },
       { slug: "input-focus", title: "Input & focus" },
+      { slug: "touch-gestures", title: "Touch & gestures" },
       { slug: "app-shell", title: "App shell & overlays" },
       { slug: "devtools", title: "DevTools" },
     ],
@@ -36,9 +36,10 @@ export const DOC_NAV: DocSection[] = [
     title: "Reference",
     items: [
       { slug: "api", title: "API reference" },
-      { slug: "tailwind", title: "Tailwind utilities" },
       { slug: "build-pipeline", title: "Build pipeline" },
       { slug: "native-contract", title: "Native contract" },
+      { slug: "platform-contracts", title: "Platform contracts" },
+      { slug: "esp-idf", title: "ESP-IDF" },
     ],
   },
 ];
@@ -54,6 +55,79 @@ export interface BlogPost {
 }
 
 export const BLOG_POSTS: BlogPost[] = [
+  {
+    slug: "blackberry-classic",
+    title:
+      "A Square Screen and a Dead Signing Server: PocketJS on the BlackBerry Classic",
+    date: "2026-08-19",
+    description:
+      "A 2014 square-screen BlackBerry, and the only thing standing between it and a freshly written frame: signing servers that went dark in January 2022. The port itself is one 547-line BB10 Core Native host over libscreen, EGL and GLES2. Around it: QNX's microkernel, where even the compositor is a user-space service; the community root project that reopened the door; a phone that appears on your desk as a network host, managed over HTTPS+CGI+XML and mounted over SMB; and an optical trackpad treated as just another relative axis.",
+    author: { name: "HalfSweet", url: "https://github.com/HalfSweet" },
+  },
+  {
+    slug: "pocketjs-on-windows-ce",
+    title: "From Message Pump to Multitouch: Windows CE, PocketJS, and the Meizu M8",
+    date: "2026-08-16",
+    description:
+      "A PocketJS port becomes an excavation of the Windows CE programming model: message pumps, HWNDs and GDI versus reactive state and declarative UI—and the shell, caches, interaction design and stubborn engineering that made the Meizu M8 feel like an iPhone.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
+  {
+    slug: "agent-native-runtime-embedded-systems",
+    title: "Taking a Step Further Towards an Agent-Native Runtime on Embedded Systems",
+    date: "2026-08-15",
+    description:
+      "Pocket Pi's Bundle-first runtime proved installable Apps on an ESP32-P4. This post derives the next architecture from first principles: protected native mechanisms, one PocketJS substrate, a JavaScript System Framework, bounded Guests, durable App Data, and a path from source-native revision to hardware portability and System OTA.",
+    author: { name: 'Siwei "Jerry" Yuan', url: "https://github.com/siwei-yuan" },
+  },
+  {
+    slug: "pocket-pi-agent-native-runtime",
+    title: "Designing Apps for Humans and Agents in an Agent-Native Runtime",
+    date: "2026-08-11",
+    description:
+      "What should an App be when both a human and an Agent can act on it? Pocket Pi derives the answer from first principles: each App is a firmware-independent product unit executed by one or more isolated PocketJS Guests, built from App-owned SQLite Data, actor-neutral Actions, and a fixed human-facing View. Tools and UI intents become two surfaces over the same behavior; a resident Pi Agent coordinates many isolated Apps and can help evolve each complete product boundary without teaching firmware what the product means.",
+    author: { name: 'Siwei "Jerry" Yuan', url: "https://github.com/siwei-yuan" },
+  },
+  {
+    slug: "pocket-voxel",
+    title: "Pocket Voxel: A Creature-RPG From First Principles",
+    date: "2026-08-07",
+    description:
+      "A Game Boy creature-RPG and the mod that presents it as a walking 3D voxel diorama, both Lua on LÖVE, rewritten as a TypeScript gameplay guest and a Rust scene core on a real 2004 PSP. You bring the cartridge. Inside: the inverted split that puts the whole game state in QuickJS, luajit re-running the original as a bit-for-bit oracle, the hardware bug determinism could never catch, and the campaign that took outdoor frames from 102 ms to a locked 30 fps.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
+  {
+    slug: "pocketjs-on-the-first-iphone",
+    title: "No Shaders, No Objective-C: PocketJS on the First iPhone",
+    date: "2026-08-06",
+    description:
+      "Xcode 26 still compiles ARMv6, but its classic linker crashes on the Objective-C metadata its own compiler emits \u2014 so the UIKit host for a 2007 iPhone is C that registers its classes through the Objective-C runtime at startup. And the PowerVR MBX Lite predates shaders, so the renderer feeding it has none either: the two lines of GLSL PocketJS used on Symbian turn out to be exactly glOrthof plus GL_MODULATE. Verified by reading the phone's own framebuffer back over USB and diffing it against the reference rasterizer \u2014 0.04 of 255. Then the part where we measured the result wrong three times running and published the opposite of the truth.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
+  {
+    slug: "pocket-pi-on-esp32-p4",
+    title: "Just Enough Node: Porting the Pi Coding Agent to the ESP32-P4",
+    date: "2026-08-06",
+    description:
+      "Pi is a TypeScript coding agent harness people build on, and it runs wherever Node ≥ 22 runs — nowhere near a microcontroller. We wanted the complete agent living on embedded hardware, not a screen paired to a server, so we ported it layer by layer: a Node-shaped runtime in Rust around QuickJS (the unmodified 9 MB pi-coding-agent runs on the desktop with no Node installed), a 304 KB pi-agent-core profile for the board after the 46.6 MB measurement, native Rust tools standing in for POSIX on LittleFS, a streaming model transport over Wi-Fi or UART, and a PocketJS UI wired end to end. What Pi assumes, what the chip lacks, what broke, and how it ran.",
+    author: { name: 'Siwei "Jerry" Yuan', url: "https://github.com/siwei-yuan" },
+  },
+  {
+    slug: "octane-on-psp",
+    title: "useState at 333 MHz: Octane Is PocketJS's Third Framework",
+    date: "2026-07-30",
+    description:
+      "React itself can't run on a 2004 Sony PSP — 333 MHz, 32 MB of RAM. Octane compiles React's programming model instead of shipping its runtime, so we made it PocketJS's third framework beside Solid and Vue Vapor. Between \"it boots\" and 60 FPS: a WeakMap the JS engine's GC never frees, the discovery that a 2021 build flag had been silently shipping an unoptimized interpreter ever since, and a hard rule — on hardware like this, continuous animation never touches setState. Full three-framework benchmark included; every demo ends up inside the 16.7 ms frame budget.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
+  {
+    slug: "pocketjs-on-symbian",
+    title: "Symbian Wanted a Frame Function: PocketJS on a Nokia E7",
+    date: "2026-07-26",
+    description:
+      "Solid components, a Cover Flow launcher, a real Figma file and a 3D FPS, running natively on Symbian Belle. What the active-object model is, and what a new machine is allowed to change.",
+    author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
+  },
   {
     slug: "pocket-vapor",
     title: "Pocket Vapor: Vue, Compiled All the Way Down",
@@ -135,4 +209,3 @@ export const BLOG_POSTS: BlogPost[] = [
     author: { name: 'Yifeng "Evan" Wang', url: "https://github.com/doodlewind" },
   },
 ];
-

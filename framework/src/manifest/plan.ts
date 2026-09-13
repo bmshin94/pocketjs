@@ -1,9 +1,12 @@
+import type { HostExtension } from "./host-extension.ts";
 import { createHash } from "node:crypto";
 import type { PocketManifestV2 } from "../../../contracts/spec/pocket-manifest.ts";
 import type { PresentationMode, Viewport } from "../../../contracts/spec/platforms.ts";
 
 export interface ResolvedBuildPlanContent {
-  readonly app: Pick<PocketManifestV2, "id" | "title"> &
+  /** Package identity travels with the plan: native hosts derive their
+   *  platform package id and version from here, never from a second copy. */
+  readonly app: Pick<PocketManifestV2, "id" | "title" | "version"> &
     Pick<PocketManifestV2["app"], "entry" | "framework"> & {
     readonly output: string;
   };
@@ -17,9 +20,28 @@ export interface ResolvedBuildPlanContent {
     readonly presentation: PresentationMode;
     /** Target-owned raster samples per logical pixel; layout stays logical. */
     readonly rasterDensity: number;
+    /** Which manifest viewport variant the target resolved — hosts derive
+     *  size-locking from the plan, never by re-reading the manifest. */
+    readonly policy: "fixed" | "dynamic";
+  };
+  /** Additional resolved UI outputs. Omitted when the application did not
+   * declare display.auxiliary or its enhancement was unavailable. */
+  readonly surfaces?: {
+    readonly auxiliary: {
+      readonly logical: Viewport;
+      readonly physical: Viewport;
+      readonly presentation: PresentationMode;
+      readonly rasterDensity: number;
+    };
   };
   /** Required APIs are true; enhancements reflect target availability. */
   readonly features: Readonly<Record<string, boolean>>;
+  /** Companion service names from the manifest (app.companions): the exact
+   *  svcOpen strings the app's adapters speak. Hosts build their svc
+   *  allowlist from this list (issue #295). */
+  readonly companions: readonly string[];
+  /** Versioned, content-verified adapter payload. */
+  readonly hostExtension?: HostExtension;
 }
 
 export interface ResolvedBuildPlan extends ResolvedBuildPlanContent {

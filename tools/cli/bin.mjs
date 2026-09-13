@@ -8,9 +8,11 @@
 //   pocket check|compile|build --target <psp|vita> [...args]
 //                            resolve pocket.json once, then build from its plan
 //   pocket play vita <demo> build, install and launch a demo in Vita3K
+//   pocket play ios <demo>  build, stage and launch a demo on the iOS simulator
 //   pocket dev|psp|vita|hw|psplink|devtools|tape [...args]
 //                            low-level passthrough to the checkout's bun scripts
 //   pocket symbian <cmd>      Nokia E7 toolchain doctor/setup/build/deploy
+//   pocket ios <cmd>          Apple iOS doctor/setup/build/play on the simulator
 //
 // The published CLI ships the same manifest consumed by PocketJS build scripts.
 
@@ -51,6 +53,24 @@ function findCheckout(from = process.cwd()) {
       try {
         if (JSON.parse(readFileSync(pkg, "utf8")).name === "@pocketjs/framework") return dir;
       } catch {}
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/** Resolve a project-local published framework when no source checkout owns cwd. */
+function findFrameworkInstallation(from = process.cwd()) {
+  if (process.env.POCKETJS_FRAMEWORK_ROOT?.trim()) {
+    const explicit = resolve(process.env.POCKETJS_FRAMEWORK_ROOT.trim());
+    return existsSync(join(explicit, "tools", "pocket.ts")) ? explicit : null;
+  }
+  let dir = resolve(from);
+  for (;;) {
+    const candidate = join(dir, "node_modules", "@pocketjs", "framework");
+    if (existsSync(join(candidate, "package.json")) && existsSync(join(candidate, "tools", "pocket.ts"))) {
+      return candidate;
     }
     const parent = dirname(dir);
     if (parent === dir) return null;
@@ -368,6 +388,7 @@ const SCRIPTS = {
   psp: "tools/psp.ts",
   vita: "tools/vita.ts",
   symbian: "tools/symbian.ts",
+  ios: "tools/ios.ts",
   hw: "tools/hw.ts",
   psplink: "tools/psplink.ts",
   devtools: "tools/devtools.ts",
@@ -376,7 +397,24 @@ const SCRIPTS = {
 };
 
 function manifestCommand(cmd, args) {
-  passthroughScript(cmd, "tools/pocket.ts", [cmd, ...args]);
+  const root = process.env.POCKETJS_FRAMEWORK_ROOT?.trim()
+    ? findFrameworkInstallation()
+    : findCheckout() ?? findFrameworkInstallation();
+  if (!root) {
+    console.error(C.bad(
+      "PocketJS framework not found — install @pocketjs/framework in this project or set POCKETJS_FRAMEWORK_ROOT",
+    ));
+    process.exit(1);
+  }
+  if (!which("bun")) {
+    console.error(C.bad("bun not found — install Bun to compile an application package"));
+    process.exit(1);
+  }
+  const r = spawnSync("bun", [join(root, "tools/pocket.ts"), cmd, ...args], {
+    stdio: "inherit",
+    cwd: process.cwd(),
+  });
+  process.exit(r.status ?? 1);
 }
 
 function passthrough(cmd, args) {
@@ -408,14 +446,20 @@ const HELP = `${C.bold("pocket")} — the PocketJS toolchain CLI
   pocket setup [--yes]     install what doctor found missing
   pocket create <name>     scaffold a pocket.json v2 app under apps/<name>
   pocket check --target T  validate pocket.json, target APIs and app types
+  pocket check --host-profile FILE
+                           validate against an ESP-IDF product host
   pocket compile --target T
                            check + emit JS/pak from one resolved build plan
   pocket build --target T  check + compile + package PSP or Vita artifacts
+  pocket build --host-profile FILE
+                           build a .pocket for an ESP-IDF product host
   pocket play vita <app>   build, install and launch a demo in Vita3K
+  pocket play ios <app>    build, stage and launch a demo on the iOS simulator
   pocket dev <app>-main    build + serve an app in the browser
   pocket psp <app>         build the PSP EBOOT
   pocket vita <app>        build the PS Vita VPK
   pocket symbian <cmd>      Nokia E7 doctor/setup/build-probe/deploy
+  pocket ios <cmd>         Apple iOS doctor/setup/build/play on the simulator
   pocket hw <app>          build + run on a real PSP over PSPLINK
   pocket psplink           interactive multi-app switcher on a real PSP
   pocket devtools [app]    DevTools panel + USB debug bridge (one command)
@@ -441,6 +485,7 @@ switch (cmd) {
   case "psp":
   case "vita":
   case "symbian":
+  case "ios":
   case "hw":
   case "psplink":
   case "devtools":

@@ -257,10 +257,14 @@ pub struct Resolved {
     pub inset: [f32; 4],
     pub display: u8,
     pub overflow: u8,
+    pub hit_pass: u8,
     pub z_index: i32,
     pub bg_color: u32,
     pub grad_from: u32,
     pub grad_to: u32,
+    pub grad_via: u32,
+    /// Middle-stop position along the from-to direction; NAN disables it.
+    pub grad_via_pos: f32,
     /// spec::GradDir ordinal, or NO_GRADIENT.
     pub grad_dir: u32,
     pub radius: f32,
@@ -326,10 +330,13 @@ impl Default for Resolved {
             inset: [f32::NAN; 4],
             display: spec::Display::Flex as u8,
             overflow: spec::Overflow::Visible as u8,
+            hit_pass: 0,
             z_index: 0,
             bg_color: 0,
             grad_from: 0,
             grad_to: 0,
+            grad_via: 0,
+            grad_via_pos: f32::NAN,
             grad_dir: NO_GRADIENT,
             radius: 0.0,
             opacity: 1.0,
@@ -366,6 +373,21 @@ impl Default for Resolved {
 }
 
 impl Resolved {
+    /// True when this style declares any non-translation transform — THE
+    /// text-provider gate, shared verbatim by layout build (recording) and
+    /// the draw walk (divergence detection), so the two sides can never
+    /// disagree on what a subtree's transforms call for. Pure translations
+    /// don't count: TEXT_RUN places its box exactly under them.
+    pub fn declares_transform(&self) -> bool {
+        self.rotate != 0.0
+            || self.scale != 1.0
+            || self.scale_x != 1.0
+            || self.scale_y != 1.0
+            || self.rotate_x != 0.0
+            || self.rotate_y != 0.0
+            || self.perspective > 0.0
+    }
+
     /// Apply one (prop id, raw u32 payload). Unknown props are ignored.
     pub fn apply(&mut self, prop: u8, bits: u32) {
         use spec::prop as p;
@@ -400,10 +422,13 @@ impl Resolved {
             p::INSET_L => self.inset[3] = f,
             p::DISPLAY => self.display = bits as u8,
             p::OVERFLOW => self.overflow = bits as u8,
+            p::HIT_PASS => self.hit_pass = bits as u8,
             p::Z_INDEX => self.z_index = bits as i32,
             p::BG_COLOR => self.bg_color = bits,
             p::GRAD_FROM => self.grad_from = bits,
             p::GRAD_TO => self.grad_to = bits,
+            p::GRAD_VIA => self.grad_via = bits,
+            p::GRAD_VIA_POS => self.grad_via_pos = f,
             p::GRAD_DIR => self.grad_dir = bits,
             p::RADIUS => self.radius = f,
             p::OPACITY => self.opacity = f,
@@ -473,10 +498,13 @@ impl Resolved {
             p::INSET_L => self.inset[3].to_bits(),
             p::DISPLAY => self.display as u32,
             p::OVERFLOW => self.overflow as u32,
+            p::HIT_PASS => self.hit_pass as u32,
             p::Z_INDEX => self.z_index as u32,
             p::BG_COLOR => self.bg_color,
             p::GRAD_FROM => self.grad_from,
             p::GRAD_TO => self.grad_to,
+            p::GRAD_VIA => self.grad_via,
+            p::GRAD_VIA_POS => self.grad_via_pos.to_bits(),
             p::GRAD_DIR => self.grad_dir,
             p::RADIUS => self.radius.to_bits(),
             p::OPACITY => self.opacity.to_bits(),

@@ -1,3 +1,5 @@
+import { isHostExtension, type HostExtension } from "./host-extension.ts";
+import { canonicalJson } from "./plan.ts";
 import {
   PRESENTATION_MODES,
   type PresentationMode,
@@ -8,6 +10,13 @@ import { verifyPlanHash, type ResolvedBuildPlan } from "./plan.ts";
 /** Stable subset of the internal build plan consumed by custom native hosts. */
 export interface HostBuildInputs {
   readonly appOutput: string;
+  /** Package identity from the manifest, as the plan resolved it. Hosts map
+   *  it onto their platform's package id and version scheme. */
+  readonly app: {
+    readonly id: string;
+    readonly title: string;
+    readonly version: string;
+  };
   readonly target: string;
   readonly hostAbi: number;
   readonly viewport: {
@@ -16,6 +25,15 @@ export interface HostBuildInputs {
     readonly presentation: PresentationMode;
     readonly rasterDensity: number;
   };
+  readonly surfaces?: {
+    readonly auxiliary: {
+      readonly logical: Viewport;
+      readonly physical: Viewport;
+      readonly presentation: PresentationMode;
+      readonly rasterDensity: number;
+    };
+  };
+  readonly hostExtension?: HostExtension;
 }
 
 export interface ExtractHostBuildInputsOptions {
@@ -42,8 +60,20 @@ function hasHostInputShape(input: unknown): input is ResolvedBuildPlan {
   if (!isRecord(input.viewport) || !isRecord(input.features)) return false;
   if (
     typeof input.app.id !== "string" || input.app.id.length === 0 ||
-    typeof input.app.title !== "string" || input.app.title.length === 0
+    typeof input.app.title !== "string" || input.app.title.length === 0 ||
+    typeof input.app.version !== "string" || input.app.version.length === 0
   ) return false;
+  if (input.surfaces !== undefined) {
+    if (!isRecord(input.surfaces) || !isRecord(input.surfaces.auxiliary)) return false;
+    const auxiliary = input.surfaces.auxiliary;
+    if (!isViewport(auxiliary.logical) || !isViewport(auxiliary.physical)) return false;
+    if (!PRESENTATION_MODES.includes(auxiliary.presentation as PresentationMode)) return false;
+    if (
+      !Number.isInteger(auxiliary.rasterDensity) ||
+      (auxiliary.rasterDensity as number) < 1 ||
+      (auxiliary.rasterDensity as number) > 255
+    ) return false;
+  }
   if (typeof input.app.output !== "string" || input.app.output.length === 0) return false;
   if (typeof input.target.id !== "string" || input.target.id.length === 0) return false;
   if (!Number.isInteger(input.target.hostAbi) || (input.target.hostAbi as number) < 1) return false;
@@ -55,6 +85,7 @@ function hasHostInputShape(input: unknown): input is ResolvedBuildPlan {
     (input.viewport.rasterDensity as number) > 255
   ) return false;
   if (typeof input.planHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(input.planHash)) return false;
+  if (input.hostExtension !== undefined && !isHostExtension(input.hostExtension)) return false;
   return Object.values(input.features).every((available) => typeof available === "boolean");
 }
 
@@ -91,6 +122,11 @@ export function extractHostBuildInputs(
   }
   return {
     appOutput: plan.app.output,
+    app: {
+      id: plan.app.id,
+      title: plan.app.title,
+      version: plan.app.version,
+    },
     target: plan.target.id,
     hostAbi: plan.target.hostAbi,
     viewport: {
@@ -99,6 +135,8 @@ export function extractHostBuildInputs(
       presentation: plan.viewport.presentation,
       rasterDensity: plan.viewport.rasterDensity,
     },
+    ...(plan.surfaces ? { surfaces: plan.surfaces } : {}),
+    ...(plan.hostExtension ? { hostExtension: plan.hostExtension } : {}),
   };
 }
 
@@ -109,6 +147,9 @@ export function hostBuildEnvironment(
 ): Readonly<Record<string, string>> {
   return {
     POCKETJS_APP_OUTPUT: inputs.appOutput,
+    POCKETJS_APP_ID: inputs.app.id,
+    POCKETJS_APP_TITLE: inputs.app.title,
+    POCKETJS_APP_VERSION: inputs.app.version,
     POCKETJS_EMBED_APP: options.embedApp ? "1" : "0",
     POCKETJS_OUTPUT_DIR: options.outputDirectory,
     POCKETJS_TARGET: inputs.target,
@@ -119,5 +160,12 @@ export function hostBuildEnvironment(
     POCKETJS_PHYSICAL_HEIGHT: String(inputs.viewport.physical[1]),
     POCKETJS_PRESENTATION: inputs.viewport.presentation,
     POCKETJS_RASTER_DENSITY: String(inputs.viewport.rasterDensity),
+    POCKETJS_AUX_LOGICAL_WIDTH: inputs.surfaces ? String(inputs.surfaces.auxiliary.logical[0]) : "",
+    POCKETJS_AUX_LOGICAL_HEIGHT: inputs.surfaces ? String(inputs.surfaces.auxiliary.logical[1]) : "",
+    POCKETJS_AUX_PHYSICAL_WIDTH: inputs.surfaces ? String(inputs.surfaces.auxiliary.physical[0]) : "",
+    POCKETJS_AUX_PHYSICAL_HEIGHT: inputs.surfaces ? String(inputs.surfaces.auxiliary.physical[1]) : "",
+    POCKETJS_AUX_PRESENTATION: inputs.surfaces ? inputs.surfaces.auxiliary.presentation : "",
+    POCKETJS_AUX_RASTER_DENSITY: inputs.surfaces ? String(inputs.surfaces.auxiliary.rasterDensity) : "",
+    ...(inputs.hostExtension ? { POCKETJS_HOST_EXTENSION: canonicalJson(inputs.hostExtension) } : {}),
   };
 }

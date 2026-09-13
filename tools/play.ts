@@ -49,7 +49,8 @@ function demos(): string[] {
 function usage(message?: string): never {
   if (message) console.error(`play: ${message}\n`);
   console.error(
-    "usage: bun play vita <demo> [--fullscreen] [--no-build] [--no-launch] [--framework=solid|vue-vapor]\n" +
+    "usage: bun play vita <demo> [--fullscreen] [--no-build] [--no-launch] [--framework=solid|vue-vapor|octane]\n" +
+      "       bun play ios <demo>  [ios flags — see `bun tools/ios.ts --help`]\n" +
       `demos: ${demos().join(", ")}`,
   );
   process.exit(message ? 2 : 0);
@@ -124,9 +125,19 @@ const args = Bun.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) usage();
 const platform = args.shift();
 const demoArg = args.shift();
-const playTargets = { vita: true } as const;
+const playTargets = { vita: true, ios: true } as const;
 if (!platform || !(platform in playTargets)) usage(`unsupported platform ${platform ?? "<missing>"}`);
 if (!demoArg) usage("missing demo name");
+
+if (platform === "ios") {
+  // tools/ios.ts owns the Apple flow, its flags included (see `pocket ios`).
+  const proc = Bun.spawn([Bun.which("bun") ?? "bun", `${ROOT}tools/ios.ts`, "play", demoArg, ...args], {
+    cwd: ROOT,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  process.exit(await proc.exited);
+}
 
 const fullscreen = args.includes("--fullscreen");
 const noBuild = args.includes("--no-build");
@@ -149,7 +160,8 @@ if (!existsSync(sourceConfig)) {
 }
 
 const requestedFramework =
-  framework?.slice("--framework=".length) || (demo.endsWith("vue-vapor") ? "vue-vapor" : "solid");
+  framework?.slice("--framework=".length) ||
+  (demo.endsWith("vue-vapor") ? "vue-vapor" : demo.endsWith("octane") ? "octane" : "solid");
 
 if (!noBuild) {
   const manifest = demoManifestFor(ROOT, demo, requestedFramework) as Record<string, any>;

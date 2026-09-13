@@ -18,6 +18,7 @@ import { pushButtonHandlerBlock, onButtonPress, onFrame, type ButtonPressOptions
 import { getOps, hostViewport } from "./host.ts";
 import { pushFocusGrid, pushFocusScope, type FocusGridOptions, type FocusScopeOptions } from "./input.ts";
 import { getOverlayRoot } from "./overlay.ts";
+import { getAuxiliarySurfaceRoots } from "./display.ts";
 import { View, type ViewProps } from "./primitives.ts";
 import {
   createElement,
@@ -29,7 +30,18 @@ import {
 } from "./renderer.ts";
 import { setDebugName } from "./native-tree.ts";
 
-export { View, Text, Image, Sprite, type ViewProps, type TextProps, type ImageProps, type SpriteProps } from "./primitives.ts";
+export {
+  View,
+  Text,
+  Image,
+  Sprite,
+  CompositorSurface,
+  type ViewProps,
+  type TextProps,
+  type ImageProps,
+  type SpriteProps,
+  type CompositorSurfaceProps,
+} from "./primitives.ts";
 export {
   DeepZoom,
   type DeepZoomGesture,
@@ -192,6 +204,11 @@ export function Portal(props: PortalProps): SolidJSX.Element {
         insetB: 0,
         insetL: 0,
         zIndex: 1000,
+        // Pure plumbing: a full-screen box that must NEVER claim a hit
+        // itself (bounds facts would resolve every touch to it — the
+        // overlay-root lesson of op 42, portal edition). Its CONTENT still
+        // claims normally (a modal scrim keeps blocking touches behind it).
+        hitPass: 1,
       },
       undefined,
     );
@@ -204,6 +221,69 @@ export function Portal(props: PortalProps): SolidJSX.Element {
     if (host?.parent) detachNode(host.parent, host);
   });
 
+  return null;
+}
+
+export interface AuxiliarySurfaceProps {
+  children?: SolidJSX.Element | (() => SolidJSX.Element);
+}
+
+/** Mount children into the current AppInstance's auxiliary output. */
+export function AuxiliarySurface(props: AuxiliarySurfaceProps): SolidJSX.Element {
+  let host: NodeMirror | undefined;
+  let dispose: (() => void) | undefined;
+  onMount(() => {
+    const surface = getAuxiliarySurfaceRoots();
+    host = createElement("view");
+    setProp(
+      host,
+      "style",
+      {
+        width: surface.viewport.width,
+        height: surface.viewport.height,
+        overflow: ENUMS.Overflow.Hidden,
+      },
+      undefined,
+    );
+    insertNode(surface.app, host);
+    dispose = rendererRender(() => renderPortalChild(props.children) as NodeMirror, host);
+  });
+  onCleanup(() => {
+    dispose?.();
+    if (host?.parent) detachNode(host.parent, host);
+  });
+  return null;
+}
+
+/** Render overlay content above the auxiliary application layer. */
+export function AuxiliaryPortal(props: AuxiliarySurfaceProps): SolidJSX.Element {
+  let host: NodeMirror | undefined;
+  let dispose: (() => void) | undefined;
+  onMount(() => {
+    const surface = getAuxiliarySurfaceRoots();
+    host = createElement("view");
+    setProp(
+      host,
+      "style",
+      {
+        width: surface.viewport.width,
+        height: surface.viewport.height,
+        posType: ENUMS.PosType.Absolute,
+        insetT: 0,
+        insetR: 0,
+        insetB: 0,
+        insetL: 0,
+        hitPass: 1,
+      },
+      undefined,
+    );
+    insertNode(surface.overlay, host);
+    dispose = rendererRender(() => renderPortalChild(props.children) as NodeMirror, host);
+  });
+  onCleanup(() => {
+    dispose?.();
+    if (host?.parent) detachNode(host.parent, host);
+  });
   return null;
 }
 

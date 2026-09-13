@@ -39,12 +39,16 @@ import {
   type NodeMirror,
 } from "./renderer.ts";
 import { setOverlayRoot } from "./overlay.ts";
+import { mountAuxiliarySurface, unmountAuxiliarySurface } from "./display.ts";
 import { registerStyles, resolveStyle } from "./styles.ts";
-import { handleFrame, setHitRoot, setInputRoot } from "./input.ts";
+import { handleFrame, setAuxiliaryHitRoot, setHitRoot, setInputRoot } from "./input.ts";
+import { __runGestures, resetGestures } from "./gesture.ts";
+import { installTouchActivation } from "./touch-activation.ts";
 import { __setAnalog, resetFrameHooks, runFrameHooks } from "./frame.ts";
 import { __resetTouches, __setTouches } from "./touch.ts";
 import { __advanceClock, resetClock } from "./clock.ts";
 import { __drainEffects, resetEffects } from "./effects.ts";
+import { runServicePumps } from "./services.ts";
 import { entries as pakEntries, get as pakGet, hasPack, loadPack } from "./pak.ts";
 import { STYLE_IDS as DEFAULT_STYLE_IDS } from "./styles.generated.ts";
 import { ENUMS, SCREEN_H, SCREEN_W } from "../../contracts/spec/spec.ts";
@@ -220,6 +224,8 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
     }
   }
 
+  const auxiliary = mountAuxiliarySurface(host.ops);
+
   // Live-viewport hosts publish their logical UI size as ui.__viewport (the
   // core root is already sized to it via Ui::set_viewport); PSP/web hosts omit
   // it and keep the 480x272 contract.
@@ -240,6 +246,10 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
     insetB: 0,
     insetL: 0,
     zIndex: 1000,
+    // Self-transparent to hit testing (spec prop hitPass): the empty layer
+    // must not swallow bounds hit facts aimed at app content beneath it —
+    // portal/OSK content INSIDE it still claims normally.
+    hitPass: 1,
   });
   insertNode(rootMirror, appRoot);
   insertNode(rootMirror, overlayRoot);
@@ -249,17 +259,31 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
 
   setInputRoot(appRoot);
   setHitRoot(rootMirror); // hit tests see the overlay layer too
+  setAuxiliaryHitRoot(auxiliary?.native ?? null);
   resetFrameHooks();
+  resetGestures();
+  // The default tap->press recognizer registers FIRST: every component
+  // gesture mounted after it wins priority (docs/TOUCH.md §0).
+  installTouchActivation();
   resetClock(); // latches the host's __simHz clock policy (docs/DETERMINISM.md)
   resetEffects();
   initDevtools(host.ops); // DevTools shim (docs/DEVTOOLS.md): flight recorder +
   // debug channel; one branch per frame when no transport is connected.
   installFrameHandler(
-    wrapFrameHandler((buttons: number, analog: number, touches?: readonly number[]) => {
+    wrapFrameHandler((
+      buttons: number,
+      analog: number,
+      touches?: readonly number[],
+      hits?: readonly number[],
+      touchSurfaces?: readonly number[],
+      rightAnalog?: number,
+    ) => {
       __advanceClock(); // virtual frame++, fire due after() timers
-      __setAnalog(analog); // latch the nub before any app code reads it
-      __setTouches(touches); // latch logical front-panel contacts for this frame
+      __setAnalog(analog, rightAnalog); // latch the nub before any app code reads it
+      __setTouches(touches, hits, touchSurfaces); // latch contacts + surface-specific hit facts
+      runServicePumps(); // only modules with pending async work register here
       __drainEffects(); // frame-boundary deliveries enter the world first
+      __runGestures(); // contact lifecycles resolve before app hooks read them
       runFrameHooks(buttons); // app lifecycle callbacks: onFrame/onButtonPress/etc.
       handleFrame(buttons); // edge-detect, focus nav, onPress (runs effects)
       runSweep(); // then destroy subtrees still detached [R]
@@ -271,9 +295,11 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
   return () => {
     removeResizeViewportHook();
     __resetTouches();
+    resetGestures();
     dispose(); // tears down reactivity only — universal keeps the nodes
     setInputRoot(null); // drops focus state (native focus dies with the nodes)
     setHitRoot(null);
+    setAuxiliaryHitRoot(null);
     setOverlayRoot(null);
     appLayer = null;
     overlayLayer = null;
@@ -281,6 +307,7 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
       child.parent = null;
       host.ops.destroyNode(child.id); // recursive native destroy
     }
+    unmountAuxiliarySurface(host.ops);
     runSweep(); // anything already detached this frame is garbage too
   };
 }

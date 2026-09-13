@@ -19,7 +19,15 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { createWasmUi } from "../hosts/web/wasm-ops.js";
-import { expandTape, type Tape } from "../framework/src/devtools.ts";
+import {
+  expandTape,
+  expandTapeAnalog,
+  expandTapeRightAnalog,
+  expandTapeTouch,
+  expandTapeTouchSurfaces,
+  type Tape,
+} from "../framework/src/devtools.ts";
+import { __packTouch } from "../framework/src/touch.ts";
 import { encodePNG } from "../tests/png.ts";
 import { SCREEN_H, SCREEN_W } from "../contracts/spec/spec.ts";
 
@@ -70,7 +78,14 @@ function fnv1a(bytes: Uint8Array): string {
 }
 
 interface BootResult {
-  frame: (buttons: number) => void;
+  frame: (
+    buttons: number,
+    analog?: number,
+    touches?: readonly number[],
+    hits?: readonly number[],
+    touchSurfaces?: readonly number[],
+    rightAnalog?: number,
+  ) => void;
   tick: () => void;
   render: () => Uint8Array;
   outbox: string[];
@@ -98,7 +113,7 @@ async function boot(app: string): Promise<BootResult> {
   };
   const src = await Bun.file(RUNTIME_DIST + app + ".js").text();
   (0, eval)(src);
-  const frame = g.frame as ((buttons: number) => void) | undefined;
+  const frame = g.frame as BootResult["frame"] | undefined;
   if (typeof frame !== "function") {
     throw new Error("bundle did not install globalThis.frame (does the entry call render()?)");
   }
@@ -139,6 +154,10 @@ const [, , cmd, app, tapePathArg] = process.argv;
 async function cmdReplay(): Promise<void> {
   const tape = loadTape(tapePathArg);
   const masks = expandTape(tape);
+  const analogs = expandTapeAnalog(tape);
+  const rightAnalogs = expandTapeRightAnalog(tape);
+  const touches = expandTapeTouch(tape);
+  const touchSurfaces = expandTapeTouchSurfaces(tape);
   const hashesOut = argValue("--hashes");
   const assertPath = argValue("--assert");
   const pngFrames = new Set(
@@ -153,7 +172,7 @@ async function cmdReplay(): Promise<void> {
   if (pngFrames.size) mkdirSync(outdir, { recursive: true });
   const hashes: string[] = [];
   for (let f = 0; f < masks.length; f++) {
-    b.frame(masks[f]);
+    b.frame(masks[f], analogs[f], touches[f], undefined, touchSurfaces[f], rightAnalogs[f]);
     b.tick();
     const fb = b.render();
     const h = fnv1a(fb);
@@ -189,11 +208,15 @@ async function cmdReplay(): Promise<void> {
 async function cmdTree(): Promise<void> {
   const tape = loadTape(tapePathArg);
   const masks = expandTape(tape);
+  const analogs = expandTapeAnalog(tape);
+  const rightAnalogs = expandTapeRightAnalog(tape);
+  const touches = expandTapeTouch(tape);
+  const touchSurfaces = expandTapeTouchSurfaces(tape);
   const at = Number(argValue("--at") ?? masks.length);
   const upTo = Math.min(at, masks.length);
   const b = await boot(app);
   for (let f = 0; f < upTo; f++) {
-    b.frame(masks[f]);
+    b.frame(masks[f], analogs[f], touches[f], undefined, touchSurfaces[f], rightAnalogs[f]);
     b.tick();
   }
   b.outbox.length = 0;
@@ -229,6 +252,34 @@ async function cmdRecord(): Promise<void> {
     else masks.push([m, 1]);
   }
   const tape: Tape = { v: 1, app, frames, masks, startFrame: 0 };
+  // Touch script (level-triggered): "frame:id,x,y[+id,x,y…]" entries joined
+  // by ';', "frame:-" releases. e.g. --touch "12:0,240,136;20:-"
+  const touchArg = argValue("--touch");
+  if (touchArg) {
+    const events: { f: number; contacts: number[] }[] = [];
+    for (const entry of touchArg.split(";").filter(Boolean)) {
+      const [fStr, spec] = entry.split(":");
+      const contacts =
+        spec === "-"
+          ? []
+          : spec.split("+").map((triple) => {
+              const [id, x, y] = triple.split(",").map(Number);
+              return __packTouch(id, x, y);
+            });
+      events.push({ f: Number(fStr), contacts });
+    }
+    events.sort((a, b) => a.f - b.f);
+    const touch: [number, number[]][] = [];
+    for (let i = 0; i < events.length; i++) {
+      if (events[i].contacts.length === 0) continue;
+      const end = Math.min(i + 1 < events.length ? events[i + 1].f : frames, frames);
+      for (let f = events[i].f; f < end; f++) touch.push([f, events[i].contacts]);
+    }
+    if (touch.length > 0) {
+      tape.v = 2;
+      tape.touch = touch;
+    }
+  }
   writeFileSync(out, JSON.stringify(tape) + "\n");
   console.log(`tape: wrote ${out} (${frames} frames)`);
 }
@@ -239,7 +290,7 @@ else if (cmd === "record" && app) await cmdRecord();
 else {
   console.log(
     "usage:\n" +
-      '  bun tools/tape.ts record <app> --frames N [--input "f:mask,..."] --out t.json\n' +
+      '  bun tools/tape.ts record <app> --frames N [--input "f:mask,..."] [--touch "f:id,x,y;f:-"] --out t.json\n' +
       "  bun tools/tape.ts replay <app> <tape.json> [--hashes out.json | --assert hashes.json | --png f1,f2 [--outdir d]]\n" +
       "  bun tools/tape.ts tree   <app> <tape.json> --at N",
   );

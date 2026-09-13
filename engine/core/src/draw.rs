@@ -31,7 +31,9 @@ use crate::tree::Tree;
 /// The core -> backend command list: flat little-endian u32 words.
 /// Format pinned in contracts/spec/spec.ts ("DRAWLIST op format"); op codes in
 /// spec::draw_op. On wasm the host reads this as a Uint32Array; on PSP,
-/// hosts/psp/src/ge.rs walks it into sceGu calls.
+/// hosts/psp/src/ge.rs walks it into sceGu calls. The words are the COMPLETE
+/// pixel truth — TEXT_RUN packs its run string's UTF-8 bytes into the stream,
+/// so snapshots, hashes and damage diffs never need side data.
 pub struct DrawList {
     pub words: Vec<u32>,
 }
@@ -125,6 +127,7 @@ impl Affine {
     fn is_axis_aligned(&self) -> bool {
         self.b == 0.0 && self.c == 0.0 && self.a > 0.0 && self.d > 0.0
     }
+
 }
 
 // ---- 3D transforms (perspective subtrees) ---------------------------------------
@@ -310,8 +313,24 @@ fn ceilf(x: f32) -> f32 {
 #[derive(Clone, Copy)]
 enum Fill {
     Flat(u32),
-    /// from/to already opacity-scaled; dir = spec::GradDir ordinal.
-    Grad { from: u32, to: u32, dir: u32 },
+    /// Colors already opacity-scaled; dir = spec::GradDir ordinal. The
+    /// optional middle stop is `(color, position)` along from -> to.
+    Grad { from: u32, via: Option<(u32, f32)>, to: u32, dir: u32 },
+}
+
+fn gradient_color(from: u32, via: Option<(u32, f32)>, to: u32, f: f32) -> u32 {
+    let f = clampf(f, 0.0, 1.0);
+    if let Some((middle, position)) = via {
+        let position = clampf(position, 0.0, 1.0);
+        if position > 0.0 && position < 1.0 {
+            return if f <= position {
+                lerp_color(from, middle, f / position)
+            } else {
+                lerp_color(middle, to, (f - position) / (1.0 - position))
+            };
+        }
+    }
+    lerp_color(from, to, f)
 }
 
 /// Color of a local-rect corner under a fill. Corner order: 0 TL, 1 TR,
@@ -319,7 +338,7 @@ enum Fill {
 fn corner_color(fill: &Fill, corner: usize) -> u32 {
     match *fill {
         Fill::Flat(c) => c,
-        Fill::Grad { from, to, dir } => {
+        Fill::Grad { from, to, dir, .. } => {
             let at_from = match dir {
                 d if d == spec::GradDir::ToTop as u32 => corner == 2 || corner == 3, // from at bottom
                 d if d == spec::GradDir::ToLeft as u32 => corner == 1 || corner == 2, // from at right
@@ -389,7 +408,7 @@ fn vertical_gradient(fill: &Fill) -> bool {
 fn fill_color_at(fill: &Fill, x0: f32, y0: f32, x1: f32, y1: f32, sx0: i32, sy: i32, sx1: i32, coverage: u32) -> u32 {
     let color = match *fill {
         Fill::Flat(color) => color,
-        Fill::Grad { from, to, dir } => {
+        Fill::Grad { from, via, to, dir } => {
             let horizontal = dir == spec::GradDir::ToLeft as u32 || dir == spec::GradDir::ToRight as u32;
             let (p, denom) = if horizontal {
                 (((sx0 + sx1) as f32 * 0.5) - x0, x1 - x0)
@@ -397,11 +416,12 @@ fn fill_color_at(fill: &Fill, x0: f32, y0: f32, x1: f32, y1: f32, sx0: i32, sy: 
                 (sy as f32 + 0.5 - y0, y1 - y0)
             };
             let f = if denom <= 0.0 { 0.0 } else { clampf(p / denom, 0.0, 1.0) };
-            if dir == spec::GradDir::ToTop as u32 || dir == spec::GradDir::ToLeft as u32 {
-                lerp_color(to, from, f)
+            let directed = if dir == spec::GradDir::ToTop as u32 || dir == spec::GradDir::ToLeft as u32 {
+                1.0 - f
             } else {
-                lerp_color(from, to, f)
-            }
+                f
+            };
+            gradient_color(from, via, to, directed)
         }
     };
     scale_alpha_coverage(color, coverage)
@@ -460,6 +480,16 @@ fn disc_texture(
     }
     let byte_len = (dim * dim * 4) as usize;
     let mut px = alloc::vec![0u8; byte_len];
+    // Solid white RGB everywhere (alpha carries coverage): bilinear sampling
+    // must never blend the fill toward black padding texels, or corners grow
+    // a dark fringe on light fills.
+    let mut i = 0;
+    while i < byte_len {
+        px[i] = 255;
+        px[i + 1] = 255;
+        px[i + 2] = 255;
+        i += 4;
+    }
     let c = raster_radius as f32; // disc center in raster pixels
     let rr = c * c;
     for y in 0..size {
@@ -478,9 +508,6 @@ fn disc_texture(
             }
             if covered > 0 {
                 let o = ((y * dim + x) * 4) as usize;
-                px[o] = 255;
-                px[o + 1] = 255;
-                px[o + 2] = 255;
                 px[o + 3] = ((covered * 255 + 8) / 16) as u8;
             }
         }
@@ -499,7 +526,13 @@ fn disc_texture(
             h: dim,
             psm: spec::psm::PSM_8888,
             palette: None,
-            linear: false,
+            // Linear: GL hosts sample the AA coverage smoothly under the
+            // fixed-function interpolators' sub-texel drift (SGX-class ES1.1
+            // parts turn NEAREST drift into staircased corners); at exact
+            // 1:1 texel alignment — every density-1 software raster — linear
+            // collapses to the nearest texel, so golden-pinned output is
+            // byte-identical.
+            linear: true,
             revision: 0,
         },
     );
@@ -697,9 +730,53 @@ fn claims_hit(
 /// hit beats clicking whatever sits BEHIND visible 3D content.
 /// Returns the generation-tagged id, or 0.
 pub fn hit_test(tree: &Tree, styles: &StyleTable, screen: (f32, f32), x: f32, y: f32) -> i32 {
-    let root_slot = crate::tree::split_id(spec::ROOT_ID).1;
+    hit_test_root(tree, styles, spec::ROOT_ID, screen, x, y)
+}
+
+pub fn hit_test_root(
+    tree: &Tree,
+    styles: &StyleTable,
+    root_id: i32,
+    screen: (f32, f32),
+    x: f32,
+    y: f32,
+) -> i32 {
+    hit_point(tree, styles, root_id, screen, x, y, true)
+}
+
+/// Topmost node at a logical point by LAYOUT BOX alone (spec op
+/// hitTestBounds; the touch hit FACT resolver). The identical walk minus the
+/// `claims_hit` ink requirement: pure layout containers claim their box, so
+/// a finger in a list's row gap still resolves to the list — UIKit bounds
+/// semantics. Everything else (paint order, clips, transforms, opacity
+/// culling, 3D contexts) matches `hit_test` exactly.
+pub fn hit_test_bounds(tree: &Tree, styles: &StyleTable, screen: (f32, f32), x: f32, y: f32) -> i32 {
+    hit_test_bounds_root(tree, styles, spec::ROOT_ID, screen, x, y)
+}
+
+pub fn hit_test_bounds_root(
+    tree: &Tree,
+    styles: &StyleTable,
+    root_id: i32,
+    screen: (f32, f32),
+    x: f32,
+    y: f32,
+) -> i32 {
+    hit_point(tree, styles, root_id, screen, x, y, false)
+}
+
+fn hit_point(
+    tree: &Tree,
+    styles: &StyleTable,
+    root_id: i32,
+    screen: (f32, f32),
+    x: f32,
+    y: f32,
+    ink: bool,
+) -> i32 {
+    let Some(root_slot) = tree.resolve(root_id) else { return 0 };
     let mut hit = 0i32;
-    hit_walk(tree, styles, screen, root_slot, Affine::IDENTITY, 1.0, Clip::viewport(screen), x, y, &mut hit);
+    hit_walk(tree, styles, screen, root_slot, Affine::IDENTITY, 1.0, Clip::viewport(screen), x, y, ink, &mut hit);
     hit
 }
 
@@ -714,6 +791,7 @@ fn hit_walk(
     clip: Clip,
     px: f32,
     py: f32,
+    ink: bool,
     hit: &mut i32,
 ) {
     // The point is fixed, so a clip that excludes it excludes the node AND
@@ -735,9 +813,9 @@ fn hit_walk(
     }
     let local = local_point(&world, px, py);
     let inside = local.is_some_and(|(lx, ly)| lx >= 0.0 && lx < l.w && ly >= 0.0 && ly < l.h);
-    if inside {
+    if inside && r.hit_pass == 0 {
         let (lx, ly) = local.unwrap();
-        if claims_hit(node, &r, styles, lx, ly, l.w, l.h) {
+        if !ink || claims_hit(node, &r, styles, lx, ly, l.w, l.h) {
             *hit = node.id(slot);
         }
     }
@@ -756,13 +834,13 @@ fn hit_walk(
         // 3D context: projected geometry is not point-testable from the 2D
         // walk — the context root claims its own box so clicks never fall
         // through to content painted BEHIND the visible 3D subtree.
-        if inside {
+        if inside && r.hit_pass == 0 {
             *hit = node.id(slot);
         }
         return;
     }
     for_children_in_paint_order(tree, styles, slot, |cs| {
-        hit_walk(tree, styles, screen, cs, world, op, child_clip, px, py, hit);
+        hit_walk(tree, styles, screen, cs, world, op, child_clip, px, py, ink, hit);
     });
 }
 
@@ -776,6 +854,15 @@ struct Walker<'a> {
     /// [0, screen.0] x [0, screen.1] (i16-safe; hosts cap it well under 32k).
     screen: (f32, f32),
     glyph_scratch: Vec<crate::text::GlyphPos>,
+    /// Inside a perspective subtree (paint_3d): text always uses the baked
+    /// pair there, so the provider-divergence check must not fire.
+    in_3d: bool,
+    /// Set when a text node's RECORDED provider no longer matches what the
+    /// declared-transform path calls for (a paint-only transform changed
+    /// since the last relayout, in either direction). Ui::draw() re-decides
+    /// and REPAINTS before returning, so no frame with a stale pair ever
+    /// leaves draw() (see lib.rs draw()).
+    provider_stale: bool,
     /// Core texture slots + free list (baked corner discs allocate lazily
     /// during the walk, through the same slot storage as uploads).
     textures: &'a mut Vec<crate::TexSlot>,
@@ -808,7 +895,44 @@ pub fn build(
     inspect_id: i32,
     inspect_prev: Option<(f32, f32, f32, f32)>,
     cursor: Option<(u32, f32, f32, f32, f32)>,
-) -> (Option<(f32, f32, f32, f32)>, Option<(f32, f32, f32, f32)>) {
+) -> (Option<(f32, f32, f32, f32)>, Option<(f32, f32, f32, f32)>, bool) {
+    build_root(
+        tree,
+        styles,
+        fonts,
+        frame,
+        spec::ROOT_ID,
+        screen,
+        textures,
+        tex_free,
+        discs,
+        raster_density,
+        dl,
+        inspect_id,
+        inspect_prev,
+        cursor,
+    )
+}
+
+/// Build one independent output root into its own DrawList while sharing the
+/// Ui resource tables and frame clock.
+#[allow(clippy::too_many_arguments)]
+pub fn build_root(
+    tree: &Tree,
+    styles: &StyleTable,
+    fonts: &Fonts,
+    frame: u64,
+    root_id: i32,
+    screen: (f32, f32),
+    textures: &mut Vec<crate::TexSlot>,
+    tex_free: &mut Vec<u32>,
+    discs: &mut DiscCache,
+    raster_density: u32,
+    dl: &mut DrawList,
+    inspect_id: i32,
+    inspect_prev: Option<(f32, f32, f32, f32)>,
+    cursor: Option<(u32, f32, f32, f32, f32)>,
+) -> (Option<(f32, f32, f32, f32)>, Option<(f32, f32, f32, f32)>, bool) {
     dl.words.clear();
     // DevTools (docs/DEVTOOLS.md): slot of the inspected node, u32::MAX = none.
     // Nodes inside a perspective subtree take the paint_3d path and are not
@@ -831,9 +955,14 @@ pub fn build(
         raster_density,
         inspect_slot,
         inspect_hit: None,
+        in_3d: false,
+        provider_stale: false,
     };
-    let root_slot = crate::tree::split_id(spec::ROOT_ID).1;
-    w.paint(root_slot, Affine::IDENTITY, 1.0, Clip::viewport(screen), dl);
+    let Some(root_slot) = tree.resolve(root_id) else {
+        return (None, None, false);
+    };
+    w.paint(root_slot, Affine::IDENTITY, 1.0, Clip::viewport(screen), false, dl);
+    let provider_stale = w.provider_stale;
     let target = w.inspect_hit.map(|c| (c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
     // Highlight glide: the drawn box exponentially approaches the target
     // (~0.35/draw ≈ converged in 6 draws), so switching the inspected node
@@ -878,13 +1007,28 @@ pub fn build(
             1.0,
         );
     }
-    (target, drawn)
+    (target, drawn, provider_stale)
 }
 
 impl<'a> Walker<'a> {
-    fn paint(&mut self, slot: u32, parent_world: Affine, opacity: f32, clip: Clip, dl: &mut DrawList) {
+    fn paint(
+        &mut self,
+        slot: u32,
+        parent_world: Affine,
+        opacity: f32,
+        clip: Clip,
+        in_transform: bool,
+        dl: &mut DrawList,
+    ) {
         let node = &self.tree.slots[slot as usize];
         let r = style::resolve(node, self.styles, true);
+        // The provider gate accumulates EXACTLY like layout.rs build() —
+        // one shared predicate (Resolved::declares_transform), so the draw
+        // walk and the layout record can only diverge when a transform
+        // VALUE changed since the last relayout, never on equivalent-but-
+        // differently-composed matrices (a scale canceled by a child's
+        // inverse must not oscillate the record).
+        let in_transform = in_transform || r.declares_transform();
         if r.display == spec::Display::None as u8 {
             return;
         }
@@ -924,6 +1068,7 @@ impl<'a> Walker<'a> {
             if has_grad {
                 let fill = Fill::Grad {
                     from: scale_alpha(r.grad_from, op),
+                    via: r.grad_via_pos.is_finite().then(|| (scale_alpha(r.grad_via, op), clampf(r.grad_via_pos, 0.0, 1.0))),
                     to: scale_alpha(r.grad_to, op),
                     dir: r.grad_dir,
                 };
@@ -944,6 +1089,7 @@ impl<'a> Walker<'a> {
         } else if has_grad {
             let fill = Fill::Grad {
                 from: scale_alpha(r.grad_from, op),
+                via: r.grad_via_pos.is_finite().then(|| (scale_alpha(r.grad_via, op), clampf(r.grad_via_pos, 0.0, 1.0))),
                 to: scale_alpha(r.grad_to, op),
                 dir: r.grad_dir,
             };
@@ -1010,7 +1156,7 @@ impl<'a> Walker<'a> {
 
         // -- text run ----------------------------------------------------------
         if node.node_type == spec::NodeType::Text as u8 {
-            self.emit_text(dl, node, &r, &world, op, &clip, l.w);
+            self.emit_text(dl, node, &r, &world, op, &clip, l.w, in_transform);
             // Text children are absorbed into the run — do not recurse.
             return;
         }
@@ -1036,6 +1182,19 @@ impl<'a> Walker<'a> {
                 (0.0, 0.0, 1.0, 1.0)
             };
             self.emit_tex_quad(dl, &world, l.w, l.h, node.tex as u32, op, &clip, fu0, fv0, fu1, fv1);
+        }
+
+        // -- installed application surface -----------------------------------
+        if node.node_type == spec::NodeType::Surface as u8 && node.compositor_surface >= 0 {
+            self.emit_compositor_surface(
+                dl,
+                &world,
+                l.w,
+                l.h,
+                node.compositor_surface as u32,
+                node.compositor_focused,
+                &clip,
+            );
         }
 
         // -- children (overflow-hidden scissor around them; z-index stable
@@ -1070,7 +1229,7 @@ impl<'a> Walker<'a> {
         // never disagree with painted stacking.
         let (tree, styles) = (self.tree, self.styles);
         for_children_in_paint_order(tree, styles, slot, |cs| {
-            self.paint(cs, world, op, child_clip, dl);
+            self.paint(cs, world, op, child_clip, in_transform, dl);
         });
 
         if scissored {
@@ -1096,6 +1255,10 @@ impl<'a> Walker<'a> {
         w: f32,
         h: f32,
     ) {
+        // Text under a perspective root always uses the baked pair; the
+        // provider-divergence check is suspended for the subtree.
+        let was_3d = self.in_3d;
+        self.in_3d = true;
         let (cx, cy) = (w * 0.5, h * 0.5);
         let mut items: Vec<(f32, Item3)> = Vec::new();
         let mut tex_cells: Vec<TexCell> = Vec::new();
@@ -1143,10 +1306,11 @@ impl<'a> Walker<'a> {
                     let node = &self.tree.slots[slot as usize];
                     let r = style::resolve(node, self.styles, true);
                     let anchor = Affine::translate(origin.0, origin.1);
-                    self.emit_text(dl, node, &r, &anchor, opacity, clip, node.layout.w);
+                    self.emit_text(dl, node, &r, &anchor, opacity, clip, node.layout.w, true);
                 }
             }
         }
+        self.in_3d = was_3d;
     }
 
     /// Depth-first 3D collection. `m` maps node-local 3D coords into the
@@ -1211,7 +1375,12 @@ impl<'a> Walker<'a> {
         // Background -> one flat quad (gradients flatten to the mid-blend;
         // radius/border/shadow are outside the 3D contract).
         let color = if r.grad_dir != NO_GRADIENT && r.grad_dir <= spec::GradDir::ToRight as u32 {
-            lerp_color(r.grad_from, r.grad_to, 0.5)
+            gradient_color(
+                r.grad_from,
+                r.grad_via_pos.is_finite().then(|| (r.grad_via, clampf(r.grad_via_pos, 0.0, 1.0))),
+                r.grad_to,
+                0.5,
+            )
         } else {
             r.bg_color
         };
@@ -1494,6 +1663,35 @@ impl<'a> Walker<'a> {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
+        // Draw a three-stop gradient as two ordinary two-stop boxes. This
+        // preserves the backend DrawList contract: every backend still sees
+        // GRAD_RECT/TRI, while clipping and rotated painter order remain in
+        // the core that resolved the Tailwind style.
+        if let Fill::Grad { from, via: Some((middle, position)), to, dir } = fill {
+            let position = clampf(position, 0.0, 1.0);
+            if position > 0.0 && position < 1.0 {
+                let first = Fill::Grad { from, via: None, to: middle, dir };
+                let second = Fill::Grad { from: middle, via: None, to, dir };
+                if dir == spec::GradDir::ToRight as u32 {
+                    let split = x0 + (x1 - x0) * position;
+                    self.emit_box(dl, world, x0, y0, split, y1, first, clip);
+                    self.emit_box(dl, world, split, y0, x1, y1, second, clip);
+                } else if dir == spec::GradDir::ToLeft as u32 {
+                    let split = x1 - (x1 - x0) * position;
+                    self.emit_box(dl, world, split, y0, x1, y1, first, clip);
+                    self.emit_box(dl, world, x0, y0, split, y1, second, clip);
+                } else if dir == spec::GradDir::ToTop as u32 {
+                    let split = y1 - (y1 - y0) * position;
+                    self.emit_box(dl, world, x0, split, x1, y1, first, clip);
+                    self.emit_box(dl, world, x0, y0, x1, split, second, clip);
+                } else {
+                    let split = y0 + (y1 - y0) * position;
+                    self.emit_box(dl, world, x0, y0, x1, split, first, clip);
+                    self.emit_box(dl, world, x0, split, x1, y1, second, clip);
+                }
+                return;
+            }
+        }
         if world.is_axis_aligned() {
             let (sx0, sy0) = world.apply(x0, y0);
             let (sx1, sy1) = world.apply(x1, y1);
@@ -1513,7 +1711,7 @@ impl<'a> Walker<'a> {
                     dl.words.push(wh_word(c.x1 - c.x0, c.y1 - c.y0));
                     dl.words.push(color);
                 }
-                Fill::Grad { from, to, dir } => {
+                Fill::Grad { from, to, dir, .. } => {
                     // Re-interpolate the endpoint colors over the clipped
                     // span so the visible slice keeps the exact gradient.
                     let (f0, f1) = if dir == spec::GradDir::ToLeft as u32 || dir == spec::GradDir::ToRight as u32 {
@@ -2227,6 +2425,48 @@ impl<'a> Walker<'a> {
         dl.words.push(scale_alpha(0xffff_ffff, op));
     }
 
+    /// Emit a native-compositor surface instruction. Unlike TEX_QUAD, full
+    /// and clipped geometry are explicit: clipping never shifts the child
+    /// realm's coordinate origin and no UV reconstruction is involved.
+    fn emit_compositor_surface(
+        &self,
+        dl: &mut DrawList,
+        world: &Affine,
+        w: f32,
+        h: f32,
+        surface: u32,
+        focused: bool,
+        clip: &Clip,
+    ) {
+        if !world.is_axis_aligned() || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let (x0, y0) = world.apply(0.0, 0.0);
+        let (x1, y1) = world.apply(w, h);
+        let visible = Clip {
+            x0: x0.max(clip.x0),
+            y0: y0.max(clip.y0),
+            x1: x1.min(clip.x1),
+            y1: y1.min(clip.y1),
+        };
+        if visible.is_empty()
+            || roundf(visible.x1 - visible.x0) <= 0.0
+            || roundf(visible.y1 - visible.y0) <= 0.0
+        {
+            return;
+        }
+        dl.words.push(spec::draw_op::SURFACE_QUAD);
+        dl.words.push(surface);
+        dl.words.push(x0.to_bits());
+        dl.words.push(y0.to_bits());
+        dl.words.push((x1 - x0).to_bits());
+        dl.words.push((y1 - y0).to_bits());
+        dl.words.push(xy_word(visible.x0, visible.y0));
+        dl.words
+            .push(wh_word(visible.x1 - visible.x0, visible.y1 - visible.y0));
+        dl.words.push(u32::from(focused));
+    }
+
     /// Emit the inline text run of a text element as one GLYPH_RUN.
     #[allow(clippy::too_many_arguments)]
     fn emit_text(
@@ -2238,14 +2478,13 @@ impl<'a> Walker<'a> {
         op: f32,
         clip: &Clip,
         box_w: f32,
+        in_transform: bool,
     ) {
         let color = scale_alpha(r.text_color, op);
         if alpha(color) == 0 {
             return;
         }
         let slot = r.font_slot as u8;
-        let Some(atlas) = self.fonts.atlas(slot) else { return };
-        let (cell_w, cell_h) = (atlas.cell_w as f32, atlas.cell_h as f32);
         let mut run = alloc::string::String::new();
         // paint() gives us the node ref; re-walk its subtree for the run.
         // (node.children ids resolve through self.tree.)
@@ -2253,6 +2492,28 @@ impl<'a> Walker<'a> {
         if run.is_empty() {
             return;
         }
+        // The node's measurement provider was RECORDED at layout time
+        // (layout.rs build(): native iff a measurer is installed, tracking
+        // is 0 and the subtree declared no transform). Paint follows the
+        // record — a node's painted glyphs always come from the provider
+        // that sized its box — but a paint-only transform (rotate/scale
+        // don't relayout) can leave the record stale in either direction:
+        // flag it, and Ui::draw() relayouts and REPAINTS within this same
+        // draw, so the frame that leaves is provider-correct. An animation
+        // crossing exact identity re-decides twice per cycle.
+        let desired_native = !self.in_3d
+            && self.fonts.native_active()
+            && r.tracking == 0.0
+            && !in_transform;
+        if desired_native != node.text_native {
+            self.provider_stale = true;
+        }
+        if node.text_native {
+            self.emit_text_native(dl, run, r, world, color, clip, box_w);
+            return;
+        }
+        let Some(atlas) = self.fonts.atlas(slot) else { return };
+        let (cell_w, cell_h) = (atlas.cell_w as f32, atlas.cell_h as f32);
         let mut scratch = core::mem::take(&mut self.glyph_scratch);
         scratch.clear();
         self.fonts
@@ -2289,6 +2550,62 @@ impl<'a> Walker<'a> {
             dl.words[start + 1] = (slot as u32) | (n << 16);
         }
         self.glyph_scratch = scratch;
+    }
+
+    /// Emit one TEXT_RUN (native text path; format in spec.ts): header words
+    /// plus the run string's UTF-8 bytes packed into the stream — the words
+    /// alone are the complete pixel truth. The origin is f32 and may sit
+    /// off-viewport, so a run not fully inside the clip is bracketed in
+    /// SCISSOR/SCISSOR_POP — the one place the core emits a scissor for its
+    /// own op rather than for children.
+    fn emit_text_native(
+        &mut self,
+        dl: &mut DrawList,
+        run: alloc::string::String,
+        r: &style::Resolved,
+        world: &Affine,
+        color: u32,
+        clip: &Clip,
+        box_w: f32,
+    ) {
+        let slot = r.font_slot as u8;
+        // Routes to the native measurer (the recorded-provider gate holds
+        // tracking at 0 on this path).
+        let (mw, mh) = self.fonts.measure_run(&run, slot, r.tracking, r.line_height);
+        if mw <= 0.0 || mh <= 0.0 {
+            return;
+        }
+        let (ox, oy) = world.apply(0.0, 0.0);
+        // Alignment places lines inside box_w, so box_w ∪ measured width
+        // bounds every glyph the backend can paint.
+        let ext_w = box_w.max(mw);
+        if ox + ext_w <= clip.x0 || ox >= clip.x1 || oy + mh <= clip.y0 || oy >= clip.y1 {
+            return;
+        }
+        let clipped =
+            ox < clip.x0 || oy < clip.y0 || ox + ext_w > clip.x1 || oy + mh > clip.y1;
+        if clipped {
+            dl.words.push(spec::draw_op::SCISSOR);
+            dl.words.push(xy_word(clip.x0, clip.y0));
+            dl.words.push(wh_word(clip.x1 - clip.x0, clip.y1 - clip.y0));
+        }
+        let bytes = run.as_bytes();
+        dl.words.push(spec::draw_op::TEXT_RUN);
+        dl.words.push((slot as u32) | ((r.text_align as u32) << 8));
+        dl.words.push(ox.to_bits());
+        dl.words.push(oy.to_bits());
+        dl.words.push(box_w.to_bits());
+        dl.words.push(r.line_height.to_bits());
+        dl.words.push(color);
+        dl.words.push(bytes.len() as u32);
+        for chunk in bytes.chunks(4) {
+            let mut w = [0u8; 4];
+            w[..chunk.len()].copy_from_slice(chunk);
+            dl.words.push(u32::from_le_bytes(w));
+        }
+        if clipped {
+            dl.words.push(spec::draw_op::SCISSOR_POP);
+        }
     }
 }
 

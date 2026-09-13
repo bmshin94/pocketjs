@@ -1,14 +1,16 @@
 // framework/compiler/bake-font.ts — bakes Inter into FONT ATLAS blobs (spec.ts format).
 //
 // One blob per font slot (a (weight, px) pair — slot table pinned in
-// framework/compiler/tailwind.ts, sizes 12/14/16/18/20/24/36, regular + bold [R]).
+// framework/compiler/tailwind.ts, legacy sizes 12/14/16/18/20/24/36 in slots
+// 0..13 plus append-only 54px regular/bold slots 14..15 [R]).
 // Charset = codepoints collected from the AST scan + ASCII 32..126 ALWAYS +
 // an extraChars option [R]. Codepoints the font does not map are simply left
 // out — the core resolves cmap misses to gid 0 (tofu) at runtime.
 //
 // Rasterization: opentype.js outlines, flattened to polylines, scanline
-// even-odd fill with horizontally-biased supersampling into 8-bit coverage
-// cells. Atlas v3 keeps cell/line/cmap metrics in LOGICAL px while baking the
+// nonzero-winding fill (the TrueType/CFF rule — even-odd cancels the shared
+// edges and overlaps some outlines are built from) with horizontally-biased
+// supersampling into 8-bit coverage cells. Atlas v3 keeps cell/line/cmap metrics in LOGICAL px while baking the
 // bitmap at `rasterDensity` samples per logical px. A Vita density-2 build can
 // therefore draw sharp 2x coverage without changing PSP-compatible layout.
 // Cells are tight in logical space: cellW = max inked logical width over the
@@ -20,7 +22,13 @@
 // xoff. gid 0 is a drawn hollow "tofu" box and is also mapped from U+FFFD so it
 // has a discoverable advance.
 
-import { parse as parseFont, type Font, type Path } from "opentype.js";
+// opentype.js ships CJS on `main` and ESM only on the bundler-only `module`
+// field, so Node's ESM loader sees no named exports. The default import is
+// the module object under both runtimes, and companions bake glyphs from
+// Node (pocket-stack/pocket-term's daemon does).
+import opentype, { type Font, type Path } from "opentype.js";
+
+const parseFont = opentype.parse;
 import {
   FONT_CMAP_ENTRY_SIZE,
   FONT_FLAG_BOLD,
@@ -36,6 +44,7 @@ import { fontSlotInfo } from "./tailwind.ts";
 const FONTS_DIR = resolve(fileURLToPath(new URL("../../assets/fonts/", import.meta.url)));
 export const DEFAULT_REGULAR = join(FONTS_DIR, "Inter-Regular.ttf");
 export const DEFAULT_BOLD = join(FONTS_DIR, "Inter-Bold.ttf");
+export const DEFAULT_MONO = join(FONTS_DIR, "JetBrainsMono-Regular.ttf");
 
 export interface BakedAtlas {
   slot: number;
@@ -52,6 +61,8 @@ export interface BakedAtlas {
 }
 
 export interface BakeOptions {
+  /** File read reporting for incremental package builds. */
+  onRead?: (path: string) => void;
   /** Codepoints collected by the pass-1 AST scan. */
   codepoints: Iterable<number>;
   /** Slots to bake (indices per framework/compiler/tailwind.ts fontSlotFor). */
@@ -62,6 +73,13 @@ export interface BakeOptions {
   rasterDensity?: number;
   regularTtf?: string;
   boldTtf?: string;
+  monoTtf?: string;
+  /** Faces tried, in order, for a codepoint the slot's own face does not
+   *  map — an icon font whose glyphs have to sit in the same atlas as the
+   *  text they label. A fallback glyph keeps its own advance, scaled to the
+   *  slot's px through its own unitsPerEm, so a double-width symbol stays
+   *  centred in its box. */
+  fallbackTtfs?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -81,8 +99,22 @@ function flatten(path: Path, curveSteps = CURVE_STEPS): Contour[] {
   let sy = 0;
   let cx = 0;
   let cy = 0;
+  // A contour has to end where it began, or the scanline fill below sees an
+  // unpaired edge and the row leaks. `Z` would say so explicitly, but
+  // opentype.js emits no `Z` for either outline format: a TrueType contour
+  // happens to end on its start point already, so the closing edge is
+  // degenerate and nothing was ever wrong here. A CFF contour is closed
+  // implicitly by the format and left open in the command list, so the edge
+  // from the last point back to the first is simply missing. Closing it costs
+  // one compare per contour and makes the fill independent of which format the
+  // outline came from.
   const close = () => {
-    if (cur.length > 1) contours.push(cur);
+    if (cur.length > 1) {
+      const first = cur[0];
+      const last = cur[cur.length - 1];
+      if (first.x !== last.x || first.y !== last.y) cur.push({ x: first.x, y: first.y });
+      contours.push(cur);
+    }
     cur = [];
   };
   for (const cmd of path.commands) {
@@ -148,32 +180,47 @@ function rasterize(contours: Contour[], cellW: number, cellH: number): Uint8Arra
   const sw = cellW * SS_X;
   const samplesPerPixel = SS_X * SS_Y;
   const counts = new Uint16Array(cellW); // covered subsamples per pixel column, one row at a time
-  const xs: number[] = [];
+  // Crossings for one scanline: x position + winding direction (+1 downward,
+  // -1 upward in y-down space). Nonzero winding — pairing sorted crossings
+  // (even-odd) erases the interior wherever two contours share an edge or
+  // overlap, which pixel-font outlines (stroke rectangles sharing stem edges)
+  // and composite glyphs (accent over base) legitimately do.
+  const edges: { x: number; w: number }[] = [];
   for (let row = 0; row < cellH; row++) {
     counts.fill(0);
     for (let sub = 0; sub < SS_Y; sub++) {
       const y = row + (sub + 0.5) / SS_Y;
-      xs.length = 0;
+      edges.length = 0;
       for (const c of contours) {
         for (let i = 0; i < c.length - 1; i++) {
           const p0 = c[i];
           const p1 = c[i + 1];
-          if ((p0.y <= y && p1.y > y) || (p1.y <= y && p0.y > y)) {
-            xs.push(p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y));
+          if (p0.y <= y && p1.y > y) {
+            edges.push({ x: p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y), w: 1 });
+          } else if (p1.y <= y && p0.y > y) {
+            edges.push({ x: p0.x + ((y - p0.y) * (p1.x - p0.x)) / (p1.y - p0.y), w: -1 });
           }
         }
       }
-      if (xs.length < 2) continue;
-      xs.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < xs.length; k += 2) {
-        // subcolumn centers inside [xs[k], xs[k+1])
-        let s0 = Math.ceil(xs[k] * SS_X - 0.5);
-        let s1 = Math.floor(xs[k + 1] * SS_X - 0.5);
-        if (s0 < 0) s0 = 0;
-        if (s1 >= sw) s1 = sw - 1;
-        for (let s = s0; s <= s1; s++) {
-          const center = (s + 0.5) / SS_X;
-          if (center >= xs[k] && center < xs[k + 1]) counts[(s / SS_X) | 0]++;
+      if (edges.length < 2) continue;
+      edges.sort((a, b) => a.x - b.x);
+      let wind = 0;
+      let spanX = 0;
+      for (const e of edges) {
+        const prev = wind;
+        wind += e.w;
+        if (prev === 0 && wind !== 0) {
+          spanX = e.x;
+        } else if (prev !== 0 && wind === 0) {
+          // subcolumn centers inside [spanX, e.x)
+          let s0 = Math.ceil(spanX * SS_X - 0.5);
+          let s1 = Math.floor(e.x * SS_X - 0.5);
+          if (s0 < 0) s0 = 0;
+          if (s1 >= sw) s1 = sw - 1;
+          for (let s = s0; s <= s1; s++) {
+            const center = (s + 0.5) / SS_X;
+            if (center >= spanX && center < e.x) counts[(s / SS_X) | 0]++;
+          }
         }
       }
     }
@@ -243,6 +290,7 @@ export function bakeSlot(
   bold: boolean,
   chars: number[],
   rasterDensity = 1,
+  fallbacks: readonly Font[] = [],
 ): BakedAtlas {
   rasterDensity = checkedRasterDensity(rasterDensity);
   const upm = font.unitsPerEm;
@@ -271,10 +319,23 @@ export function bakeSlot(
   for (const cp of chars) {
     if (cp === TOFU_CODEPOINT) continue; // reserved for gid 0
     const ch = String.fromCodePoint(cp);
-    const gi = font.charToGlyphIndex(ch);
+    // The slot's own face first; a codepoint it does not map comes from the
+    // first fallback that does. Metrics scale through the SOURCE face's
+    // unitsPerEm (opentype.js stamps it on the glyph path), so the fallback
+    // glyph lands on this slot's baseline at this slot's px.
+    let source = font;
+    let gi = font.charToGlyphIndex(ch);
+    for (let f = 0; gi <= 0 && f < fallbacks.length; f++) {
+      const candidate = fallbacks[f]!.charToGlyphIndex(ch);
+      if (candidate > 0) {
+        source = fallbacks[f]!;
+        gi = candidate;
+      }
+    }
     if (gi <= 0) continue;
-    const glyph = font.glyphs.get(gi);
-    const advance = Math.max(0, Math.min(255, Math.round((glyph.advanceWidth ?? 0) * scale)));
+    const glyph = source.glyphs.get(gi);
+    const sourceScale = source === font ? scale : px / source.unitsPerEm;
+    const advance = Math.max(0, Math.min(255, Math.round((glyph.advanceWidth ?? 0) * sourceScale)));
     const path = glyph.getPath(0, baseline, px);
     // Keep every metric byte-for-byte equivalent to the density-1 bake. The
     // higher-density contour gets more curve subdivisions, then is scaled into
@@ -388,16 +449,31 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
   }
   const chars = [...cps].sort((a, b) => a - b);
 
-  const fonts: Record<"regular" | "bold", Font | null> = { regular: null, bold: null };
+  const fonts: Record<"regular" | "bold" | "mono", Font | null> = {
+    regular: null,
+    bold: null,
+    mono: null,
+  };
+  const fallbacks: Font[] = [];
+  for (const path of opts.fallbackTtfs ?? []) {
+    opts.onRead?.(path);
+    fallbacks.push(await loadFont(path));
+  }
   const results: BakedAtlas[] = [];
   for (const slot of [...opts.slots].sort((a, b) => a - b)) {
     if (slot < 0 || slot >= MAX_FONT_SLOTS) {
       throw new Error(`PocketJS bake-font: slot ${slot} out of range (0..${MAX_FONT_SLOTS - 1})`);
     }
-    const { px, bold } = fontSlotInfo(slot);
-    const key = bold ? "bold" : "regular";
-    fonts[key] ??= await loadFont(bold ? (opts.boldTtf ?? DEFAULT_BOLD) : (opts.regularTtf ?? DEFAULT_REGULAR));
-    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity));
+    const { px, bold, mono } = fontSlotInfo(slot);
+    const key = mono ? "mono" : bold ? "bold" : "regular";
+    const path = mono
+        ? (opts.monoTtf ?? DEFAULT_MONO)
+        : bold
+          ? (opts.boldTtf ?? DEFAULT_BOLD)
+          : (opts.regularTtf ?? DEFAULT_REGULAR);
+    opts.onRead?.(path);
+    fonts[key] ??= await loadFont(path);
+    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, fallbacks));
   }
   return results;
 }

@@ -41,7 +41,7 @@ pub struct LayoutRect {
 
 /// One retained UI node.
 pub struct Node {
-    /// spec::NodeType value (0 view, 1 text, 2 image).
+    /// spec::NodeType value (0 view, 1 text, 2 image, 3 compositor surface).
     pub node_type: u8,
     /// Current generation of this slot (already masked to GEN_MASK).
     pub generation: u32,
@@ -67,6 +67,10 @@ pub struct Node {
     /// Uploaded texture handle (image nodes only; -1 = none). For an animated
     /// sprite this is the ATLAS texture; the drawn frame is a UV sub-rect of it.
     pub tex: i32,
+    /// Pocket System package surface handle (surface nodes only; -1 = none).
+    pub compositor_surface: i32,
+    /// Shell focus fact carried by SURFACE_QUAD for native scheduling/input.
+    pub compositor_focused: bool,
     /// Animated-sprite frame count over `tex` (0 = plain image, no animation).
     pub sprite_frames: u16,
     /// Atlas grid columns (frame i sits at col i%cols, row i/cols).
@@ -83,6 +87,12 @@ pub struct Node {
     pub taffy: Option<taffy::NodeId>,
     /// Rounded layout output (position relative to parent).
     pub layout: LayoutRect,
+    /// Text nodes: the measurement provider RECORDED at the last layout
+    /// build — true = the host's native measurer sized this box, so paint
+    /// MUST emit TEXT_RUN; false = baked atlas metrics, GLYPH_RUN. One
+    /// provider per node per layout, never re-decided at paint time
+    /// (docs/BACKENDS.md).
+    pub text_native: bool,
 }
 
 impl Node {
@@ -99,6 +109,8 @@ impl Node {
             anim_values: Vec::new(),
             text: String::new(),
             tex: -1,
+            compositor_surface: -1,
+            compositor_focused: false,
             sprite_frames: 0,
             sprite_cols: 0,
             sprite_step: 0,
@@ -107,6 +119,7 @@ impl Node {
             active: false,
             taffy: None,
             layout: LayoutRect::default(),
+            text_native: false,
         }
     }
 

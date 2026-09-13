@@ -201,7 +201,7 @@ fn decode_wh(word: u32) -> (i32, i32) {
 /// Walk a DrawList asserting the pinned CPU-clip invariant: every coordinate
 /// in [0, SCREEN_W] x [0, SCREEN_H], rect extents in range, scissors
 /// balanced, only known ops. Returns per-op counts (indexed by op code).
-fn validate_drawlist(words: &[u32]) -> [u32; 9] {
+fn validate_drawlist(words: &[u32]) -> [u32; 11] {
     let (sw, sh) = (spec::SCREEN_W as i32, spec::SCREEN_H as i32);
     let xy_ok = |w: u32| {
         let (x, y) = decode_xy(w);
@@ -213,7 +213,7 @@ fn validate_drawlist(words: &[u32]) -> [u32; 9] {
         let (w, h) = decode_wh(whw);
         assert!(x + w <= sw && y + h <= sh, "rect exceeds screen: {x},{y} {w}x{h}");
     };
-    let mut counts = [0u32; 9];
+    let mut counts = [0u32; 11];
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < words.len() {
@@ -246,6 +246,14 @@ fn validate_drawlist(words: &[u32]) -> [u32; 9] {
                 }
                 i += 9;
             }
+            spec::draw_op::SURFACE_QUAD => {
+                for word in i + 2..i + 6 {
+                    assert!(f32::from_bits(words[word]).is_finite());
+                }
+                rect_ok(words[i + 6], words[i + 7]);
+                assert_eq!(words[i + 8] & !1, 0, "unknown surface flags");
+                i += 9;
+            }
             spec::draw_op::SCISSOR => {
                 rect_ok(words[i + 1], words[i + 2]);
                 depth += 1;
@@ -271,6 +279,19 @@ fn validate_drawlist(words: &[u32]) -> [u32; 9] {
                     }
                 }
                 i += 12;
+            }
+            spec::draw_op::TEXT_RUN => {
+                // Native-text op: origin is f32 (exempt from the i16 clip
+                // guarantee), box width is finite and non-negative, and the
+                // packed payload decodes as valid UTF-8.
+                for f in [f32::from_bits(words[i + 2]), f32::from_bits(words[i + 3])] {
+                    assert!(f.is_finite(), "TEXT_RUN origin not finite: {f}");
+                }
+                let box_w = f32::from_bits(words[i + 4]);
+                assert!(box_w.is_finite() && box_w >= 0.0, "bad TEXT_RUN boxW: {box_w}");
+                let (text, next) = decode_text_run_text(words, i);
+                assert!(!text.is_empty(), "TEXT_RUN with empty payload");
+                i = next;
             }
             other => panic!("unknown draw op {other} at word {i}"),
         }
@@ -304,9 +325,14 @@ fn tex_tri_runs(words: &[u32]) -> Vec<(u32, usize)> {
                 i += 3 + 2 * ((words[i + 1] >> 16) as usize);
             }
             spec::draw_op::TEX_QUAD => { previous_was_tex_tri = false; i += 9; }
+            spec::draw_op::SURFACE_QUAD => { previous_was_tex_tri = false; i += 9; }
             spec::draw_op::SCISSOR => { previous_was_tex_tri = false; i += 3; }
             spec::draw_op::SCISSOR_POP => { previous_was_tex_tri = false; i += 1; }
             spec::draw_op::TRI => { previous_was_tex_tri = false; i += 7; }
+            spec::draw_op::TEXT_RUN => {
+                previous_was_tex_tri = false;
+                i += 8 + (words[i + 7] as usize).div_ceil(4);
+            }
             other => panic!("unknown draw op {other} at word {i}"),
         }
     }
@@ -367,6 +393,67 @@ fn insert_before_dom_move_semantics() {
     ui.insert_before(b, wrap, 0);
     ui.tick();
     assert_eq!(ui.layout_of(wrap).unwrap().1, 40.0); // still under root, after c+a
+}
+
+#[test]
+fn clipped_compositor_surface_keeps_full_geometry_and_shell_z_order() {
+    let mut ui = Ui::new();
+    let absolute_box = |ui: &mut Ui, node: i32, x: f64, y: f64, w: f64, h: f64, z: f64| {
+        ui.set_prop(node, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
+        ui.set_prop(node, spec::prop::INSET_L, x);
+        ui.set_prop(node, spec::prop::INSET_T, y);
+        ui.set_prop(node, spec::prop::WIDTH, w);
+        ui.set_prop(node, spec::prop::HEIGHT, h);
+        ui.set_prop(node, spec::prop::Z_INDEX, z);
+    };
+
+    let under = ui.create_node(spec::NodeType::View as u8);
+    absolute_box(&mut ui, under, 0.0, 0.0, 200.0, 160.0, 0.0);
+    ui.set_prop(under, spec::prop::BG_COLOR, abgr(1, 2, 3, 255) as f64);
+    ui.insert_before(spec::ROOT_ID, under, 0);
+
+    let clipper = ui.create_node(spec::NodeType::View as u8);
+    absolute_box(&mut ui, clipper, 20.0, 30.0, 80.0, 60.0, 1.0);
+    ui.set_prop(
+        clipper,
+        spec::prop::OVERFLOW,
+        spec::Overflow::Hidden as u32 as f64,
+    );
+    ui.insert_before(spec::ROOT_ID, clipper, 0);
+
+    let surface = ui.create_node(spec::NodeType::Surface as u8);
+    absolute_box(&mut ui, surface, 0.0, 0.0, 100.0, 100.0, 0.0);
+    ui.set_compositor_surface(surface, 7, true);
+    ui.insert_before(clipper, surface, 0);
+
+    let over = ui.create_node(spec::NodeType::View as u8);
+    absolute_box(&mut ui, over, 0.0, 0.0, 12.0, 12.0, 2.0);
+    ui.set_prop(over, spec::prop::BG_COLOR, abgr(4, 5, 6, 255) as f64);
+    ui.insert_before(spec::ROOT_ID, over, 0);
+
+    let words = ui.draw().words.clone();
+    validate_drawlist(&words);
+    let surface_at = words
+        .iter()
+        .position(|word| *word == spec::draw_op::SURFACE_QUAD)
+        .unwrap();
+    let under_at = words
+        .windows(4)
+        .position(|op| op[0] == spec::draw_op::RECT && op[3] == abgr(1, 2, 3, 255))
+        .unwrap();
+    let over_at = words
+        .windows(4)
+        .position(|op| op[0] == spec::draw_op::RECT && op[3] == abgr(4, 5, 6, 255))
+        .unwrap();
+    assert!(under_at < surface_at && surface_at < over_at);
+
+    let frames = ui.compositor_surface_frames();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].handle, 7);
+    assert_eq!(frames[0].full, [20.0, 30.0, 100.0, 100.0]);
+    assert_eq!(frames[0].clip, [20.0, 30.0, 80.0, 60.0]);
+    assert!(frames[0].focused);
+    assert_eq!(ui.compositor_surface_bindings(), vec![(7, true)]);
 }
 
 #[test]
@@ -656,6 +743,49 @@ fn drawlist_clip_invariant_offscreen_rects() {
 }
 
 #[test]
+fn three_stop_gradient_splits_into_clipped_drawlist_segments() {
+    let mut ui = Ui::new();
+    let n = ui.create_node(0);
+    ui.set_prop(n, spec::prop::WIDTH, 100.0);
+    ui.set_prop(n, spec::prop::HEIGHT, 20.0);
+    ui.set_prop(n, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
+    ui.set_prop(n, spec::prop::INSET_T, 10.0);
+    ui.set_prop(n, spec::prop::INSET_L, -25.0);
+    ui.set_prop(n, spec::prop::GRAD_FROM, abgr(0, 0, 0, 255) as f64);
+    ui.set_prop(n, spec::prop::GRAD_VIA, abgr(100, 100, 100, 255) as f64);
+    ui.set_prop(n, spec::prop::GRAD_VIA_POS, 0.5);
+    ui.set_prop(n, spec::prop::GRAD_TO, abgr(200, 200, 200, 255) as f64);
+    ui.set_prop(n, spec::prop::GRAD_DIR, spec::GradDir::ToRight as u32 as f64);
+    ui.insert_before(spec::ROOT_ID, n, 0);
+    ui.tick();
+
+    let words = ui.draw().words.clone();
+    validate_drawlist(&words);
+    let mut segments = Vec::new();
+    let mut i = 0usize;
+    while i < words.len() {
+        match words[i] {
+            spec::draw_op::RECT => i += 4,
+            spec::draw_op::GRAD_RECT => {
+                let (x, _) = decode_xy(words[i + 1]);
+                let (w, _) = decode_wh(words[i + 2]);
+                segments.push((x, w, words[i + 3], words[i + 4], words[i + 5]));
+                i += 6;
+            }
+            spec::draw_op::TRI => i += 7,
+            spec::draw_op::GLYPH_RUN => i += 3 + 2 * ((words[i + 1] >> 16) as usize),
+            spec::draw_op::TEX_QUAD => i += 9,
+            spec::draw_op::SCISSOR => i += 3,
+            _ => i += 1,
+        }
+    }
+    assert_eq!(segments, vec![
+        (0, 25, abgr(50, 50, 50, 255), abgr(100, 100, 100, 255), spec::GradDir::ToRight as u32),
+        (25, 50, abgr(100, 100, 100, 255), abgr(200, 200, 200, 255), spec::GradDir::ToRight as u32),
+    ]);
+}
+
+#[test]
 fn rounded_boxes_emit_subpixel_edge_coverage() {
     let mut ui = Ui::new();
     let n = ui.create_node(0);
@@ -766,6 +896,53 @@ fn ui_rejects_zero_raster_density() {
 }
 
 #[test]
+fn tick_rate_is_fixed_once_the_realm_has_ticked() {
+    let mut ui = Ui::new();
+    assert_eq!(ui.tick_rate(), 60, "spec default");
+    assert!(!ui.set_tick_rate(0), "0 Hz is not a rate");
+    assert_eq!(ui.tick_rate(), 60);
+    assert!(!ui.set_tick_rate(crate::MAX_TICK_HZ + 1), "above the ceiling");
+    assert_eq!(ui.tick_rate(), 60);
+    assert!(ui.set_tick_rate(crate::MAX_TICK_HZ), "the ceiling itself is a rate");
+    assert!(ui.set_tick_rate(120));
+    assert_eq!(ui.tick_rate(), 120);
+    ui.tick();
+    assert!(!ui.set_tick_rate(60));
+    assert_eq!(ui.tick_rate(), 120, "a running realm keeps its step size");
+}
+
+#[test]
+fn tick_rate_is_fixed_even_when_every_tick_was_paused() {
+    let mut ui = Ui::new();
+    ui.debug_pause(true);
+    ui.tick();
+    assert!(
+        !ui.set_tick_rate(120),
+        "a swallowed tick still starts the run — the frame counter alone would readmit a rate change here"
+    );
+    assert_eq!(ui.tick_rate(), 60);
+}
+
+#[test]
+fn a_120_hz_realm_runs_a_tween_over_twice_the_frames() {
+    let mut at = |hz: u32| {
+        let mut ui = Ui::new();
+        ui.set_tick_rate(hz);
+        let n = ui.create_node(0);
+        ui.insert_before(spec::ROOT_ID, n, 0);
+        ui.animate(n, spec::prop::OPACITY, 0.0, 200, 0, 0);
+        let mut frames = 0;
+        while ui.resolved_style(n).unwrap().opacity > 0.0 && frames < 1000 {
+            ui.tick();
+            frames += 1;
+        }
+        frames
+    };
+    assert_eq!(at(60), 12, "200 ms at 60 Hz");
+    assert_eq!(at(120), 24, "the same 200 ms of virtual time");
+}
+
+#[test]
 fn transparent_rounded_border_draws_an_outline_not_square_strips() {
     let mut ui = Ui::new();
     let blue = abgr(37, 99, 235, 255);
@@ -822,24 +999,52 @@ fn transparent_rounded_border_draws_an_outline_not_square_strips() {
 #[test]
 fn rounded_gradients_emit_rect_coverage_spans() {
     let mut ui = Ui::new();
+    let from = abgr(251, 191, 36, 255);
+    let via = abgr(255, 255, 255, 255);
     let n = ui.create_node(0);
     ui.set_prop(n, spec::prop::WIDTH, 120.0);
     ui.set_prop(n, spec::prop::HEIGHT, 12.0);
     ui.set_prop(n, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
-    ui.set_prop(n, spec::prop::INSET_T, 20.0);
+    ui.set_prop(n, spec::prop::INSET_T, 20.5);
     ui.set_prop(n, spec::prop::INSET_L, 20.0);
     ui.set_prop(n, spec::prop::RADIUS, 6.0);
-    ui.set_prop(n, spec::prop::GRAD_FROM, abgr(251, 191, 36, 255) as f64);
+    ui.set_prop(n, spec::prop::GRAD_FROM, from as f64);
+    ui.set_prop(n, spec::prop::GRAD_VIA, via as f64);
+    ui.set_prop(n, spec::prop::GRAD_VIA_POS, 0.5);
     ui.set_prop(n, spec::prop::GRAD_TO, abgr(217, 119, 6, 255) as f64);
-    ui.set_prop(n, spec::prop::GRAD_DIR, spec::GradDir::ToRight as u32 as f64);
+    ui.set_prop(n, spec::prop::GRAD_DIR, spec::GradDir::ToBottom as u32 as f64);
     ui.insert_before(spec::ROOT_ID, n, 0);
     ui.tick();
-    let counts = validate_drawlist(&ui.draw().words.clone());
+    let words = ui.draw().words.clone();
+    let counts = validate_drawlist(&words);
     assert!(counts[spec::draw_op::RECT as usize] > 0);
     assert_eq!(
         counts[spec::draw_op::GRAD_RECT as usize], 0,
         "rounded gradients must not rely on 1px-high GRAD_RECT triangle strips"
     );
+    let (_, layout_y, _, layout_h) = ui.layout_of(n).unwrap();
+    let target_y = 26;
+    let gradient_fraction = (target_y as f32 + 0.5 - layout_y) / layout_h;
+    let expected = crate::anim::interp(from, via, gradient_fraction / 0.5, true);
+    let mut via_segment = false;
+    let mut i = 0usize;
+    while i < words.len() {
+        match words[i] {
+            spec::draw_op::RECT => {
+                let (x, y) = decode_xy(words[i + 1]);
+                let (w, h) = decode_wh(words[i + 2]);
+                via_segment |= x <= 80 && 80 < x + w && y <= target_y && target_y < y + h
+                    && words[i + 3] == expected;
+                i += 4;
+            }
+            spec::draw_op::TRI => i += 7,
+            spec::draw_op::GLYPH_RUN => i += 3 + 2 * ((words[i + 1] >> 16) as usize),
+            spec::draw_op::TEX_QUAD => i += 9,
+            spec::draw_op::SCISSOR => i += 3,
+            _ => i += 1,
+        }
+    }
+    assert!(via_segment, "the rounded span path must preserve the middle stop");
 }
 
 #[test]
@@ -915,6 +1120,42 @@ fn overflow_hidden_emits_balanced_intersected_scissors() {
             _ => i += 1,
         }
     }
+}
+
+#[test]
+fn wrap_text_greedy_breaks_and_native_override() {
+    let mut ui = Ui::new();
+    // A=6, B=5, space=4 (synthetic atlas, slot 2).
+    let blob = encode_atlas(
+        2,
+        8,
+        8,
+        7,
+        10,
+        4,
+        &[
+            (' ' as u32, 3, 4),
+            ('A' as u32, 1, 6),
+            ('B' as u32, 2, 5),
+            (0xfffd, 0, 8),
+        ],
+    );
+    assert!(ui.load_font_atlas(&blob));
+    // Fits (or empty): no breaks.
+    assert!(ui.wrap_text("AA AA", 2, 100.0).is_empty());
+    assert!(ui.wrap_text("", 2, 30.0).is_empty());
+    // Greedy: "AA AA " = 28px + hanging space, third word overflows 30px →
+    // break BEFORE it (col 6); the trailing space stays on the upper row.
+    assert_eq!(ui.wrap_text("AA AA AA", 2, 30.0), alloc::vec![6]);
+    // A word wider than a whole row splits at character level.
+    assert_eq!(ui.wrap_text("AAAAA", 2, 13.0), alloc::vec![2, 4]);
+    // A native wrapper overrides the greedy path; clearing restores it.
+    ui.set_text_wrap(Some(alloc::boxed::Box::new(|_t: &str, _s: u8, _w: f32| {
+        alloc::vec![7, 9]
+    })));
+    assert_eq!(ui.wrap_text("AA AA AA", 2, 30.0), alloc::vec![7, 9]);
+    ui.set_text_wrap(None);
+    assert_eq!(ui.wrap_text("AA AA AA", 2, 30.0), alloc::vec![6]);
 }
 
 #[test]
@@ -1405,8 +1646,9 @@ fn size_full_sentinel_is_not_animatable() {
 
 #[test]
 fn huge_durations_do_not_overflow() {
-    assert!(crate::anim::ms_to_frames(u32::MAX) >= 1); // would panic pre-fix
-    assert_eq!(crate::anim::ms_to_frames(100_000_000), 6_000_000);
+    assert!(crate::anim::ms_to_frames(u32::MAX, 60) >= 1); // would panic pre-fix
+    assert!(crate::anim::ms_to_frames(u32::MAX, 240) >= 1);
+    assert_eq!(crate::anim::ms_to_frames(100_000_000, 60), 6_000_000);
     let mut ui = Ui::new();
     let n = ui.create_node(0);
     ui.insert_before(spec::ROOT_ID, n, 0);
@@ -2900,4 +3142,767 @@ fn stream_golden_fixture_parses() {
     init[3] = 0xff;
     let plane = ui.upload_texture(&init, 16, 16, spec::psm::PSM_T8);
     assert!(ui.update_texture_t8(plane, pal, px));
+}
+
+// ---- SVC WIRE (PKNT) — wire.rs codec + stream_rx.rs RAM ring ---------------
+
+#[test]
+fn wire_frame_header_round_trips_and_rejects_oversize() {
+    use crate::wire::{encode_frame_header, parse_frame_header};
+    let mut out = [0u8; 8];
+    assert!(encode_frame_header(spec::wire::MSG_VIDEO_SLOT, 1, 1040, &mut out));
+    let h = parse_frame_header(&out).expect("round trip");
+    assert_eq!((h.kind, h.flags, h.len), (spec::wire::MSG_VIDEO_SLOT, 1, 1040));
+    assert!(parse_frame_header(&out[..7]).is_none(), "short header");
+    assert!(
+        !encode_frame_header(0x10, 0, spec::wire::MAX_PAYLOAD as u32 + 1, &mut out),
+        "oversize refused at encode"
+    );
+    out[4..8].copy_from_slice(&(spec::wire::MAX_PAYLOAD as u32 + 1).to_le_bytes());
+    assert!(parse_frame_header(&out).is_none(), "oversize refused at parse");
+}
+
+#[test]
+fn wire_hello_and_beacon_parse() {
+    use crate::wire::{encode_hello, parse_beacon, parse_hello_ack};
+    let mut out = [0u8; 80];
+    let n = encode_hello("youtube", &mut out).expect("encodes");
+    assert_eq!(n, 7 + 7);
+    assert_eq!(&out[0..4], &spec::wire::MAGIC.to_le_bytes());
+    assert_eq!(out[4], spec::wire::VERSION);
+    assert_eq!(out[6] as usize, 7);
+    assert_eq!(&out[7..14], b"youtube");
+    assert!(encode_hello("", &mut out).is_none());
+
+    let mut ack = [0u8; 8];
+    ack[0..4].copy_from_slice(&spec::wire::MAGIC.to_le_bytes());
+    ack[4] = 1;
+    assert_eq!(parse_hello_ack(&ack), Some(1));
+    ack[0] = 0;
+    assert_eq!(parse_hello_ack(&ack), None);
+
+    let mut beacon = Vec::new();
+    beacon.extend_from_slice(&spec::wire::BEACON_MAGIC.to_le_bytes());
+    beacon.push(spec::wire::VERSION);
+    beacon.push(0);
+    beacon.extend_from_slice(&spec::wire::PORT.to_le_bytes());
+    beacon.push(7);
+    beacon.extend_from_slice(b"youtube");
+    beacon.push(3);
+    beacon.extend_from_slice(b"Mac");
+    let (port, app, name) = parse_beacon(&beacon).expect("beacon parses");
+    assert_eq!((port, app, name), (spec::wire::PORT, "youtube", "Mac"));
+    // Truncations must fail cleanly at every length.
+    for cut in 0..beacon.len() {
+        assert!(parse_beacon(&beacon[..cut]).is_none(), "cut at {cut}");
+    }
+}
+
+#[test]
+fn wire_payload_parsers_validate_and_survive_truncation() {
+    use crate::wire::{
+        parse_audio_chunk, parse_file, parse_stream_mark, parse_stream_open, parse_video_slot,
+    };
+
+    // file: pathLen · path · blob
+    let mut file = Vec::new();
+    file.extend_from_slice(&9u16.to_le_bytes());
+    file.extend_from_slice(b"thumbs/a0");
+    file.extend_from_slice(&[1, 2, 3, 4]);
+    let (path, blob) = parse_file(&file).expect("file parses");
+    assert_eq!((path, blob), ("thumbs/a0", &[1u8, 2, 3, 4][..]));
+    for cut in 0..11 {
+        assert!(parse_file(&file[..cut]).is_none(), "cut at {cut}");
+    }
+
+    // streamOpen requires exactly a 96-byte header block after the path.
+    let block = stream_header_block(0, 0, 32, 16, 2, 0, 64, 4, 0);
+    let mut open = Vec::new();
+    open.extend_from_slice(&7u16.to_le_bytes());
+    open.extend_from_slice(b"media/v");
+    open.extend_from_slice(&block);
+    let (path, got) = parse_stream_open(&open).expect("streamOpen parses");
+    assert_eq!(path, "media/v");
+    assert_eq!(got, &block[..]);
+    assert!(parse_stream_open(&open[..open.len() - 1]).is_none(), "short block refused");
+
+    // videoSlot: header · palette · indices.
+    let mut slot = Vec::new();
+    slot.extend_from_slice(&2u32.to_le_bytes()); // seq
+    slot.extend_from_slice(&7u32.to_le_bytes()); // frameIndex
+    slot.extend_from_slice(&32u16.to_le_bytes());
+    slot.extend_from_slice(&16u16.to_le_bytes());
+    slot.extend_from_slice(&0u16.to_le_bytes()); // flags
+    slot.extend_from_slice(&0u16.to_le_bytes());
+    slot.extend_from_slice(&[9u8; 1024]);
+    slot.extend_from_slice(&[5u8; 32 * 16]);
+    let msg = parse_video_slot(&slot).expect("slot parses");
+    assert_eq!((msg.seq, msg.frame_index, msg.w, msg.h, msg.rle), (2, 7, 32, 16, false));
+    assert_eq!(msg.palette.len(), 1024);
+    assert_eq!(msg.indices.len(), 32 * 16);
+    assert!(parse_video_slot(&slot[..1039]).is_none(), "short slot refused");
+    let mut zero_seq = slot.clone();
+    zero_seq[0..4].copy_from_slice(&0u32.to_le_bytes());
+    assert!(parse_video_slot(&zero_seq).is_none(), "seq 0 refused");
+
+    // audioChunk + streamMark.
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&1u32.to_le_bytes());
+    chunk.extend_from_slice(&2048u32.to_le_bytes());
+    chunk.extend_from_slice(&[0u8; 64 * 2 * 2]);
+    let msg = parse_audio_chunk(&chunk).expect("chunk parses");
+    assert_eq!((msg.seq, msg.start_frame, msg.pcm.len()), (1, 2048, 64 * 2 * 2));
+    assert!(parse_audio_chunk(&chunk[..7]).is_none());
+
+    let mut mark = Vec::new();
+    mark.extend_from_slice(&3u32.to_le_bytes());
+    mark.extend_from_slice(&spec::wire::MARK_FLAG_ENDED.to_le_bytes());
+    mark.extend_from_slice(&0u16.to_le_bytes());
+    let msg = parse_stream_mark(&mark).expect("mark parses");
+    assert!(msg.ended);
+    assert_eq!(msg.epoch, 3);
+    assert!(parse_stream_mark(&mark[..7]).is_none());
+}
+
+/// Independent reference writer: build the .pkst image with direct byte
+/// writes straight off the spec.ts layout comment — a different code path
+/// from RamStream, so equality below is a real check, not a tautology.
+fn reference_write_slot(
+    buf: &mut [u8],
+    h: &crate::stream::StreamHeaders,
+    seq: u32,
+    frame_index: u32,
+    palette: &[u8],
+    indices: &[u8],
+) {
+    let off = (h.video_off + ((seq - 1) % h.video.slot_count) * h.video.slot_size) as usize;
+    buf[off..off + 4].copy_from_slice(&seq.to_le_bytes());
+    buf[off + 4..off + 8].copy_from_slice(&frame_index.to_le_bytes());
+    buf[off + 8..off + 10].copy_from_slice(&(h.video.w as u16).to_le_bytes());
+    buf[off + 10..off + 12].copy_from_slice(&(h.video.h as u16).to_le_bytes());
+    for b in &mut buf[off + 12..off + 32] {
+        *b = 0;
+    }
+    buf[off + 32..off + 32 + 1024].copy_from_slice(palette);
+    buf[off + 1056..off + 1056 + indices.len()].copy_from_slice(indices);
+    let v = spec::stream::VRING_OFF;
+    buf[v + 20..v + 24].copy_from_slice(&seq.to_le_bytes());
+}
+
+fn reference_write_chunk(
+    buf: &mut [u8],
+    h: &crate::stream::StreamHeaders,
+    seq: u32,
+    start_frame: u32,
+    pcm: &[u8],
+) {
+    let size = crate::stream::chunk_size(h.audio.chunk_frames, h.audio.channels).unwrap();
+    let off = (h.audio_off + ((seq - 1) % h.audio.chunk_count) * size) as usize;
+    buf[off..off + 4].copy_from_slice(&seq.to_le_bytes());
+    buf[off + 4..off + 8].copy_from_slice(&start_frame.to_le_bytes());
+    for b in &mut buf[off + 8..off + 16] {
+        *b = 0;
+    }
+    buf[off + 16..off + 16 + pcm.len()].copy_from_slice(pcm);
+    let a = spec::stream::ARING_OFF;
+    buf[a + 20..a + 24].copy_from_slice(&seq.to_le_bytes());
+}
+
+#[test]
+fn ram_stream_image_equals_the_reference_file_writer() {
+    use crate::wire::{AudioChunkMsg, StreamMarkMsg, VideoSlotMsg};
+
+    let block = stream_header_block(0, 0, 32, 16, 2, 0, 64, 2, 0);
+    let h = crate::stream::parse_header_block(&block).unwrap();
+    let chunk_size = crate::stream::chunk_size(h.audio.chunk_frames, h.audio.channels).unwrap();
+    let total = (h.audio_off + h.audio.chunk_count * chunk_size) as usize;
+
+    // Reference image: header block + direct writes (3 slots so seq 3 laps
+    // slot 1's position, 2 chunks) + an epoch/ended mark.
+    let mut reference = alloc::vec![0u8; total];
+    reference[..96].copy_from_slice(&block);
+    let pal = |seed: u8| -> Vec<u8> { (0..1024).map(|i| (i as u8).wrapping_add(seed)).collect() };
+    let px = |seed: u8| -> Vec<u8> { (0..32 * 16).map(|i| (i as u8).wrapping_mul(seed)).collect() };
+    let pcm = |seed: u8| -> Vec<u8> { (0..64 * 2 * 2).map(|i| (i as u8) ^ seed).collect() };
+    for seq in 1..=3u32 {
+        reference_write_slot(&mut reference, &h, seq, seq * 2, &pal(seq as u8), &px(seq as u8));
+    }
+    for seq in 1..=2u32 {
+        reference_write_chunk(&mut reference, &h, seq, seq * 64, &pcm(seq as u8));
+    }
+    reference[8..12].copy_from_slice(&5u32.to_le_bytes()); // epoch
+    reference[6..8].copy_from_slice(&spec::stream::FLAG_ENDED.to_le_bytes());
+
+    // RamStream fed the same content as WIRE messages.
+    let mut ram = crate::stream_rx::RamStream::open(&block).expect("opens");
+    for seq in 1..=3u32 {
+        let palette = pal(seq as u8);
+        let indices = px(seq as u8);
+        assert!(ram.apply_slot(&VideoSlotMsg {
+            seq,
+            frame_index: seq * 2,
+            w: 32,
+            h: 16,
+            rle: false,
+            palette: &palette,
+            indices: &indices,
+        }));
+    }
+    for seq in 1..=2u32 {
+        let bytes = pcm(seq as u8);
+        assert!(ram.apply_chunk(&AudioChunkMsg { seq, start_frame: seq * 64, pcm: &bytes }));
+    }
+    ram.apply_mark(&StreamMarkMsg { epoch: 5, ended: true });
+
+    assert_eq!(ram.buf().len(), reference.len());
+    assert_eq!(ram.buf(), &reference[..], "RAM ring == file ring, byte for byte");
+
+    // And the shared readers see the expected world.
+    let live = crate::stream::parse_header_block(ram.buf()).unwrap();
+    assert_eq!((live.epoch, live.ended), (5, true));
+    assert_eq!(live.video.latest_seq, 3);
+    assert_eq!(live.audio.latest_seq, 2);
+    let off = crate::stream::slot_offset(&live, 3).unwrap() as usize;
+    let sh = crate::stream::parse_slot_header(&ram.buf()[off..], &live.video).unwrap();
+    assert_eq!((sh.seq, sh.frame_index), (3, 6));
+}
+
+#[test]
+fn ram_stream_decodes_rle_slots_and_rejects_bad_geometry() {
+    use crate::wire::VideoSlotMsg;
+    let block = stream_header_block(0, 0, 32, 16, 2, 0, 64, 2, 0);
+    let mut ram = crate::stream_rx::RamStream::open(&block).unwrap();
+
+    let raw: Vec<u8> = (0..32 * 16).map(|i| if i < 300 { 7 } else { (i % 5) as u8 }).collect();
+    let rle = packbits_encode(&raw);
+    assert!(rle.len() < raw.len(), "fixture should actually compress");
+    let palette = alloc::vec![1u8; 1024];
+    assert!(ram.apply_slot(&VideoSlotMsg {
+        seq: 1,
+        frame_index: 0,
+        w: 32,
+        h: 16,
+        rle: true,
+        palette: &palette,
+        indices: &rle,
+    }));
+    let h = crate::stream::parse_header_block(ram.buf()).unwrap();
+    let off = crate::stream::slot_offset(&h, 1).unwrap() as usize;
+    assert_eq!(&ram.buf()[off + 1056..off + 1056 + raw.len()], &raw[..]);
+
+    // Wrong plane, wrong palette size, wrong index count, truncated RLE.
+    assert!(!ram.apply_slot(&VideoSlotMsg {
+        seq: 2, frame_index: 1, w: 16, h: 16, rle: false, palette: &palette, indices: &raw,
+    }));
+    assert!(!ram.apply_slot(&VideoSlotMsg {
+        seq: 2, frame_index: 1, w: 32, h: 16, rle: false, palette: &palette[..512], indices: &raw,
+    }));
+    assert!(!ram.apply_slot(&VideoSlotMsg {
+        seq: 2, frame_index: 1, w: 32, h: 16, rle: false, palette: &palette, indices: &raw[..100],
+    }));
+    assert!(!ram.apply_slot(&VideoSlotMsg {
+        seq: 2, frame_index: 1, w: 32, h: 16, rle: true, palette: &palette, indices: &rle[..rle.len() / 2],
+    }));
+    // Failures must not publish a cursor.
+    let h = crate::stream::parse_header_block(ram.buf()).unwrap();
+    assert_eq!(h.video.latest_seq, 1);
+}
+
+/// Cross-language: rebuild the committed TS-written .pkst golden through
+/// RamStream (slots/chunks re-fed as WIRE messages) and require the byte-
+/// identical file image — the socket transport IS the file transport.
+#[test]
+fn ram_stream_reconstructs_the_committed_golden() {
+    use crate::wire::{AudioChunkMsg, StreamMarkMsg, VideoSlotMsg};
+    let golden: &[u8] = include_bytes!("../../../tests/fixtures/youtube-golden.pkst");
+    let h = crate::stream::parse_header_block(golden).expect("golden parses");
+
+    // Open from a PRISTINE header (cursors zeroed, epoch 0, flags 0) — the
+    // exact block a streamOpen would carry before any writes.
+    let mut pristine = golden[..96].to_vec();
+    pristine[6..8].copy_from_slice(&0u16.to_le_bytes());
+    pristine[8..12].copy_from_slice(&0u32.to_le_bytes());
+    let v = spec::stream::VRING_OFF;
+    let a = spec::stream::ARING_OFF;
+    pristine[v + 20..v + 24].copy_from_slice(&0u32.to_le_bytes());
+    pristine[a + 20..a + 24].copy_from_slice(&0u32.to_le_bytes());
+    let mut ram = crate::stream_rx::RamStream::open(&pristine).expect("opens");
+
+    // Re-feed every RESIDENT slot/chunk in seq order (the ring holds the
+    // last slot_count/chunk_count writes; lapped history is gone by design).
+    let mut slots: Vec<(u32, usize)> = Vec::new();
+    for idx in 0..h.video.slot_count {
+        let off = (h.video_off + idx * h.video.slot_size) as usize;
+        if let Some(sh) = crate::stream::parse_slot_header(&golden[off..], &h.video) {
+            slots.push((sh.seq, off));
+        }
+    }
+    slots.sort();
+    for (seq, off) in slots {
+        let sh = crate::stream::parse_slot_header(&golden[off..], &h.video).unwrap();
+        let pal = &golden[off + 32..off + 32 + 1024];
+        let px = &golden[off + 1056..off + 1056 + (h.video.w * h.video.h) as usize];
+        assert!(ram.apply_slot(&VideoSlotMsg {
+            seq,
+            frame_index: sh.frame_index,
+            w: h.video.w,
+            h: h.video.h,
+            rle: false,
+            palette: pal,
+            indices: px,
+        }));
+    }
+    let chunk_size = crate::stream::chunk_size(h.audio.chunk_frames, h.audio.channels).unwrap();
+    let pcm_bytes = (h.audio.chunk_frames * h.audio.channels * 2) as usize;
+    let mut chunks: Vec<(u32, usize)> = Vec::new();
+    for idx in 0..h.audio.chunk_count {
+        let off = (h.audio_off + idx * chunk_size) as usize;
+        if let Some(ch) = crate::stream::parse_chunk_header(&golden[off..]) {
+            chunks.push((ch.seq, off));
+        }
+    }
+    chunks.sort();
+    for (seq, off) in chunks {
+        let ch = crate::stream::parse_chunk_header(&golden[off..]).unwrap();
+        assert!(ram.apply_chunk(&AudioChunkMsg {
+            seq,
+            start_frame: ch.start_frame,
+            pcm: &golden[off + 16..off + 16 + pcm_bytes],
+        }));
+    }
+    ram.apply_mark(&StreamMarkMsg { epoch: h.epoch, ended: h.ended });
+    // Restore the golden's final cursors exactly (a lapped ring's latest may
+    // exceed the highest resident seq; apply_* published the resident max).
+    let final_v = h.video.latest_seq;
+    let final_a = h.audio.latest_seq;
+    let buf_len = ram.buf().len();
+    assert_eq!(buf_len, golden.len(), "same preallocated image size");
+    let mut image = ram.buf().to_vec();
+    image[v + 20..v + 24].copy_from_slice(&final_v.to_le_bytes());
+    image[a + 20..a + 24].copy_from_slice(&final_a.to_le_bytes());
+    assert_eq!(&image[..], golden, "socket-fed RAM ring == TS-written file, byte for byte");
+}
+
+// ---------------------------------------------------------------------------
+// touch hit facts (spec op hitTestBounds + Ui::touch_hits; docs/TOUCH.md)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hit_test_bounds_claims_pure_layout_containers() {
+    let mut ui = Ui::new();
+    // An unstyled container (a list viewport): ink-transparent, bounds-solid.
+    let viewport = ui.create_node(0);
+    ui.set_prop(viewport, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
+    ui.set_prop(viewport, spec::prop::INSET_L, 10.0);
+    ui.set_prop(viewport, spec::prop::INSET_T, 10.0);
+    ui.set_prop(viewport, spec::prop::WIDTH, 100.0);
+    ui.set_prop(viewport, spec::prop::HEIGHT, 100.0);
+    ui.insert_before(spec::ROOT_ID, viewport, 0);
+    let row = abs_box(&mut ui, viewport, 0.0, 0.0, 100.0, 20.0);
+    ui.tick();
+    // On the painted row both modes agree (paint order, depth, clips shared).
+    assert_eq!(ui.hit_test(20.0, 15.0), row);
+    assert_eq!(ui.hit_test_bounds(20.0, 15.0), row);
+    // In the row gap: ink misses, bounds resolves to the container's box —
+    // the property that lets a list own its whole viewport without painted
+    // rows under every finger (the touchRect workaround this replaces).
+    assert_eq!(ui.hit_test(20.0, 80.0), 0, "ink: nothing painted in the gap");
+    assert_eq!(ui.hit_test_bounds(20.0, 80.0), viewport, "bounds: the gap is the viewport's box");
+}
+
+#[test]
+fn touch_hit_facts_carry_from_the_down_frame() {
+    let mut ui = Ui::new();
+    let a = abs_box(&mut ui, spec::ROOT_ID, 0.0, 0.0, 50.0, 50.0);
+    let b = abs_box(&mut ui, spec::ROOT_ID, 100.0, 0.0, 50.0, 50.0);
+    ui.tick();
+    let pack = |id: u32, x: u32, y: u32| (id << 18) | (y << 9) | x;
+    let mut out = [0i32; 8];
+    // Down on A.
+    assert_eq!(ui.touch_hits(&[pack(3, 20, 20)], &mut out), 1);
+    assert_eq!(out[0], a);
+    // Drag over B: the down hit is CARRIED, never re-resolved (implicit capture).
+    assert_eq!(ui.touch_hits(&[pack(3, 120, 20)], &mut out), 1);
+    assert_eq!(out[0], a, "capture: the hit stays the down-frame hit");
+    // Lift, then a NEW id lands on B: fresh resolve.
+    assert_eq!(ui.touch_hits(&[], &mut out), 0);
+    assert_eq!(ui.touch_hits(&[pack(4, 120, 20)], &mut out), 1);
+    assert_eq!(out[0], b);
+    // Two simultaneous contacts resolve independently, in wire order.
+    ui.touch_hits(&[], &mut out);
+    let n = ui.touch_hits(&[pack(1, 20, 20), pack(2, 120, 20)], &mut out);
+    assert_eq!((n, out[0], out[1]), (2, a, b));
+}
+
+#[test]
+fn auxiliary_surface_isolates_layout_draw_and_touch_domains() {
+    let mut ui = Ui::new();
+    ui.set_viewport(400.0, 240.0);
+    let auxiliary_root = ui.create_auxiliary_surface(320.0, 240.0);
+    assert!(auxiliary_root > spec::ROOT_ID);
+    assert_eq!(ui.auxiliary_surface_root(), auxiliary_root);
+    assert_eq!(ui.auxiliary_viewport(), Some((320.0, 240.0)));
+
+    let primary = abs_box(&mut ui, spec::ROOT_ID, 10.0, 12.0, 80.0, 40.0);
+    let auxiliary = abs_box(&mut ui, auxiliary_root, 10.0, 12.0, 80.0, 40.0);
+    let red = abgr(220, 30, 20, 255);
+    let blue = abgr(20, 30, 220, 255);
+    ui.set_prop(primary, spec::prop::BG_COLOR, red as f64);
+    ui.set_prop(auxiliary, spec::prop::BG_COLOR, blue as f64);
+
+    let primary_words = ui.draw().words.clone();
+    let auxiliary_words = ui.draw_auxiliary().unwrap().words.clone();
+    validate_drawlist(&primary_words);
+    validate_drawlist(&auxiliary_words);
+    assert!(primary_words.contains(&red));
+    assert!(!primary_words.contains(&blue));
+    assert!(auxiliary_words.contains(&blue));
+    assert!(!auxiliary_words.contains(&red));
+
+    assert_eq!(ui.hit_test_bounds(20.0, 20.0), primary);
+    assert_eq!(ui.hit_test_bounds_auxiliary(20.0, 20.0), auxiliary);
+
+    let packed = [(3 << 18) | (20 << 9) | 20];
+    let mut primary_hits = [0i32; 8];
+    let mut auxiliary_hits = [0i32; 8];
+    assert_eq!(ui.touch_hits(&packed, &mut primary_hits), 1);
+    assert_eq!(ui.touch_hits_auxiliary(&packed, &mut auxiliary_hits), 1);
+    assert_eq!(primary_hits[0], primary);
+    assert_eq!(auxiliary_hits[0], auxiliary);
+
+    // Both native roots are permanent members of one tree but cannot be
+    // destroyed or nested into application content.
+    ui.destroy_node(auxiliary_root);
+    ui.insert_before(primary, auxiliary_root, 0);
+    assert_eq!(ui.auxiliary_surface_root(), auxiliary_root);
+    assert_eq!(ui.hit_test_bounds_auxiliary(20.0, 20.0), auxiliary);
+}
+
+#[test]
+fn touch_decode_reads_both_packings() {
+    assert_eq!(crate::touch::decode((7 << 18) | (200 << 9) | 300), (7, 300.0, 200.0));
+    assert_eq!(
+        crate::touch::decode(0x8000_0000 | (9 << 20) | (600 << 10) | 700),
+        (9, 700.0, 600.0)
+    );
+}
+
+#[test]
+fn hit_pass_layers_never_swallow_bounds_hits() {
+    let mut ui = Ui::new();
+    let content = abs_box(&mut ui, spec::ROOT_ID, 10.0, 10.0, 100.0, 50.0);
+    // A full-screen overlay layer ABOVE the content (the framework's portal
+    // root): hitPass makes its own box hit-transparent in BOTH walks, while
+    // its children still claim.
+    let overlay = ui.create_node(0);
+    ui.set_prop(overlay, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
+    ui.set_prop(overlay, spec::prop::INSET_L, 0.0);
+    ui.set_prop(overlay, spec::prop::INSET_T, 0.0);
+    ui.set_prop(overlay, spec::prop::WIDTH, 480.0);
+    ui.set_prop(overlay, spec::prop::HEIGHT, 272.0);
+    ui.set_prop(overlay, spec::prop::HIT_PASS, 1.0);
+    ui.insert_before(spec::ROOT_ID, overlay, 0);
+    ui.tick();
+    assert_eq!(
+        ui.hit_test_bounds(20.0, 20.0),
+        content,
+        "bounds facts resolve through the empty overlay to the content"
+    );
+    // A toast INSIDE the overlay claims over the content beneath it.
+    let toast = abs_box(&mut ui, overlay, 15.0, 15.0, 30.0, 20.0);
+    assert_eq!(ui.hit_test_bounds(20.0, 20.0), toast);
+    assert_eq!(ui.hit_test(20.0, 20.0), toast, "ink walk honors overlay content too");
+}
+
+// ---- native text (TEXT_RUN, docs/BACKENDS.md) -----------------------------------
+
+/// Decode a TEXT_RUN's packed UTF-8 payload at op index `i`; returns the
+/// string and the index past the op (spec.ts word format).
+fn decode_text_run_text(words: &[u32], i: usize) -> (alloc::string::String, usize) {
+    let len = words[i + 7] as usize;
+    let mut bytes = Vec::with_capacity(len);
+    for w in &words[i + 8..i + 8 + len.div_ceil(4)] {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes.truncate(len);
+    (
+        alloc::string::String::from_utf8(bytes).expect("TEXT_RUN payload is UTF-8"),
+        i + 8 + len.div_ceil(4),
+    )
+}
+
+/// A deterministic fake native measurer: 7 px per char, 12 px default lines.
+fn fake_native_measure() -> crate::text::MeasureFn {
+    alloc::boxed::Box::new(|text: &str, _slot, _tracking, line_h| {
+        let lines = text.split('\n').count() as f32;
+        let w = text
+            .split('\n')
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0) as f32
+            * 7.0;
+        let lh = if line_h.is_nan() { 12.0 } else { line_h };
+        (w, lines * lh)
+    })
+}
+
+#[test]
+fn native_measure_routes_layout_and_emits_text_run() {
+    let mut ui = Ui::new();
+    // Atlas registered so the BAKED path would measure differently (A=6, B=5).
+    ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        3,
+        &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)],
+    ));
+    ui.set_text_measure(Some(fake_native_measure()));
+    // The JS-facing measureText op routes to the same provider as layout.
+    assert_eq!(ui.measure_text("AB", 0), 14.0);
+    let color = abgr(10, 20, 30, 255);
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_prop(t, spec::prop::WIDTH, 30.0);
+    ui.set_prop(t, spec::prop::TEXT_COLOR, color as f64);
+    ui.set_text(t, "AB");
+    ui.insert_before(spec::ROOT_ID, t, 0);
+    ui.tick();
+    let words = ui.draw().words.clone();
+    let counts = validate_drawlist(&words);
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 1);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 0);
+    let i = words.iter().position(|&w| w == spec::draw_op::TEXT_RUN).unwrap();
+    assert_eq!(words[i + 1], 0, "slot 0, left align");
+    assert_eq!(f32::from_bits(words[i + 2]), 0.0);
+    assert_eq!(f32::from_bits(words[i + 3]), 0.0);
+    assert_eq!(f32::from_bits(words[i + 4]), 30.0, "boxW = laid-out box width");
+    assert!(f32::from_bits(words[i + 5]).is_nan(), "lineHeight NaN = slot default");
+    assert_eq!(words[i + 6], color);
+    // The run string rides IN the words — the DrawList is the complete
+    // pixel truth, no side table.
+    let (text, _) = decode_text_run_text(&words, i);
+    assert_eq!(text, "AB");
+    // taffy sized the leaf's main axis from the native metrics (12 px line),
+    // not the atlas (10 px line).
+    let l = ui.layout_of(t).unwrap();
+    assert_eq!((l.2, l.3), (30.0, 12.0));
+}
+
+#[test]
+fn tracked_and_transformed_runs_use_the_baked_pair_on_both_sides() {
+    let mut ui = Ui::new();
+    ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        3,
+        &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)],
+    ));
+    ui.set_text_measure(Some(fake_native_measure()));
+    // Tracked run: baked measurement AND baked glyphs (consistent pair).
+    let tracked = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_prop(tracked, spec::prop::TRACKING, 2.0);
+    ui.set_text(tracked, "AB");
+    ui.insert_before(spec::ROOT_ID, tracked, 0);
+    // Rotated run: ONE provider on both sides — layout records the baked
+    // pair (transformed subtree), so the box AND the glyphs are atlas
+    // metrics. Never native box + baked glyphs.
+    let rotated = ui.create_node(spec::NodeType::Text as u8);
+    // Small explicit width keeps the rotated cells on-screen (off-screen
+    // cells are dropped, which would empty the run).
+    ui.set_prop(rotated, spec::prop::WIDTH, 20.0);
+    ui.set_prop(rotated, spec::prop::ROTATE, 45.0);
+    ui.set_text(rotated, "AB");
+    ui.insert_before(spec::ROOT_ID, rotated, 0);
+    // Text under a transformed ANCESTOR takes the baked pair too. (Scale
+    // DOWN so the transformed glyph anchors stay on-screen — off-screen
+    // cells are dropped, which would empty the run.)
+    let wrap = ui.create_node(spec::NodeType::View as u8);
+    ui.set_prop(wrap, spec::prop::SCALE, 0.5);
+    let nested = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(nested, "A");
+    ui.insert_before(wrap, nested, 0);
+    ui.insert_before(spec::ROOT_ID, wrap, 0);
+    ui.tick();
+    let words = ui.draw().words.clone();
+    let counts = validate_drawlist(&words);
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 0);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 3);
+    // Column layout: width cross-stretches, so the measurement provider is
+    // observable through the main-axis HEIGHT. All three leaves measured
+    // with the atlas (10 px line), matching their painted glyphs.
+    assert_eq!(ui.layout_of(tracked).unwrap().3, 10.0);
+    assert_eq!(ui.layout_of(rotated).unwrap().3, 10.0);
+    assert_eq!(ui.layout_of(nested).unwrap().3, 10.0);
+}
+
+#[test]
+fn clipped_text_run_is_scissor_bracketed() {
+    let mut ui = Ui::new();
+    ui.set_text_measure(Some(fake_native_measure()));
+    // overflow-hidden 20x10 box; the run measures 28 px -> exceeds the clip.
+    let mut s = StyleSpec::new();
+    s.base = alloc::vec![(spec::prop::OVERFLOW, spec::Overflow::Hidden as u32)];
+    assert!(ui.load_styles(&encode_styles(&[s])));
+    let wrap = ui.create_node(spec::NodeType::View as u8);
+    ui.set_style(wrap, 0);
+    ui.set_prop(wrap, spec::prop::WIDTH, 20.0);
+    ui.set_prop(wrap, spec::prop::HEIGHT, 10.0);
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(t, "AAAA");
+    ui.insert_before(wrap, t, 0);
+    ui.insert_before(spec::ROOT_ID, wrap, 0);
+    ui.tick();
+    let words = ui.draw().words.clone();
+    validate_drawlist(&words);
+    let i = words.iter().position(|&w| w == spec::draw_op::TEXT_RUN).unwrap();
+    assert_eq!(words[i - 3], spec::draw_op::SCISSOR, "run bracketed by its own scissor");
+    assert_eq!(decode_xy(words[i - 2]), (0, 0));
+    assert_eq!(decode_wh(words[i - 1]), (20, 10), "scissor = current clip");
+    let (_, end) = decode_text_run_text(&words, i);
+    assert_eq!(words[end], spec::draw_op::SCISSOR_POP);
+}
+
+#[test]
+fn provider_re_decides_within_the_same_draw_after_a_paint_only_transform() {
+    // rotate/scale are paint-only (no relayout), so a transform set after
+    // layout leaves the recorded provider stale. The draw walk detects the
+    // divergence and Ui::draw re-decides + REPAINTS before returning: every
+    // frame that leaves draw() is provider-correct, in both directions —
+    // zero stale frames.
+    let mut ui = Ui::new();
+    ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        3,
+        &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)],
+    ));
+    ui.set_text_measure(Some(fake_native_measure()));
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_prop(t, spec::prop::WIDTH, 20.0);
+    ui.set_text(t, "AB");
+    ui.insert_before(spec::ROOT_ID, t, 0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 1);
+    assert_eq!(ui.layout_of(t).unwrap().3, 12.0, "native line height sized the box");
+
+    // Into the transform: the VERY NEXT draw is already the baked pair.
+    ui.set_prop(t, spec::prop::ROTATE, 30.0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 0);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 1);
+    assert_eq!(ui.layout_of(t).unwrap().3, 10.0, "box re-measured with the atlas");
+
+    // Out of the transform: same, back to the native pair immediately.
+    ui.set_prop(t, spec::prop::ROTATE, 0.0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 1);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 0);
+    assert_eq!(ui.layout_of(t).unwrap().3, 12.0, "box re-measured natively");
+}
+
+#[test]
+fn canceling_transforms_do_not_oscillate_the_provider() {
+    // Parent scale 0.5, child text scale 2.0: the composed world matrix is
+    // numerically a translation again, but BOTH the layout build and the
+    // draw walk gate on the same declared-transform path predicate — the
+    // node stays on the baked pair with no divergence flag, so repeated
+    // draws never schedule spurious relayouts.
+    let mut ui = Ui::new();
+    ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        3,
+        &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)],
+    ));
+    ui.set_text_measure(Some(fake_native_measure()));
+    let wrap = ui.create_node(spec::NodeType::View as u8);
+    ui.set_prop(wrap, spec::prop::WIDTH, 40.0);
+    ui.set_prop(wrap, spec::prop::SCALE, 0.5);
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_prop(t, spec::prop::SCALE, 2.0);
+    ui.set_text(t, "AB");
+    ui.insert_before(wrap, t, 0);
+    ui.insert_before(spec::ROOT_ID, wrap, 0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 0, "declared path wins");
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 1);
+    assert_eq!(ui.layout_of(t).unwrap().3, 10.0, "baked metrics sized the box");
+    // The killer assertion: a second and third draw must not have been
+    // dirtied by a provider oscillation.
+    let _ = ui.draw();
+    assert!(!ui.layout.needs(), "no spurious relayout scheduled");
+    let _ = ui.draw();
+    assert!(!ui.layout.needs());
+}
+
+#[test]
+fn text_run_words_are_the_complete_pixel_truth() {
+    let mut ui = Ui::new();
+    ui.set_text_measure(Some(fake_native_measure()));
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(t, "AB");
+    ui.insert_before(spec::ROOT_ID, t, 0);
+    ui.tick();
+    let words_ab = ui.draw().words.clone();
+    let i = words_ab.iter().position(|&w| w == spec::draw_op::TEXT_RUN).unwrap();
+    // Same length, same geometry, different content: the word stream MUST
+    // differ — the run bytes ride in the words, so a demand-render hash or
+    // a damage word-diff can never miss a text change (no hash collisions
+    // possible: the comparison is exact bytes, not a digest).
+    ui.set_text(t, "BA");
+    ui.tick();
+    let words_ba = ui.draw().words.clone();
+    let j = words_ba.iter().position(|&w| w == spec::draw_op::TEXT_RUN).unwrap();
+    assert_eq!(i, j);
+    assert_eq!(words_ab[i + 4], words_ba[j + 4], "geometry unchanged");
+    assert_ne!(words_ab, words_ba, "the payload words track the run string");
+    assert_eq!(decode_text_run_text(&words_ab, i).0, "AB");
+    assert_eq!(decode_text_run_text(&words_ba, j).0, "BA");
+    // Multi-word payload packs little-endian, zero-padded.
+    ui.set_text(t, "hello 中文");
+    ui.tick();
+    let words = ui.draw().words.clone();
+    let k = words.iter().position(|&w| w == spec::draw_op::TEXT_RUN).unwrap();
+    assert_eq!(decode_text_run_text(&words, k).0, "hello 中文");
+    validate_drawlist(&words);
+}
+
+#[test]
+fn clearing_native_measure_restores_baked_goldens_path() {
+    let mut ui = Ui::new();
+    ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        3,
+        &[(0xfffd, 0, 8), ('A' as u32, 1, 6), ('B' as u32, 2, 5)],
+    ));
+    ui.set_text_measure(Some(fake_native_measure()));
+    assert_eq!(ui.measure_text("AB", 0), 14.0);
+    ui.set_text_measure(None);
+    assert_eq!(ui.measure_text("AB", 0), 11.0);
+    let t = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(t, "AB");
+    ui.insert_before(spec::ROOT_ID, t, 0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 0);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 1);
 }

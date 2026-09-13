@@ -17,7 +17,8 @@
         "input.ime",
         "host.clipboard",
         "display.viewport.live",
-        "text.glyphs.runtime"
+        "text.glyphs.runtime",
+        "text.layout.native"
       ]
     }
   },
@@ -25,6 +26,9 @@
     "entry": "apps/note/main.tsx",
     "output": "note-main",
     "framework": "solid",
+    "companions": [
+      "note"
+    ],
     "viewport": {
       "dynamic": {
         "default": [

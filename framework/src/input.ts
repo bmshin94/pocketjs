@@ -36,11 +36,12 @@
 //     untouched (they run in frame.ts before this module).
 
 import { BTN, IMG_FLAG_RLE, PSM, SCREEN_H, SCREEN_W } from "../../contracts/spec/spec.ts";
-import { ticksPerFrame } from "./clock.ts";
+import { ticksPerFrame, TICKS_PER_SECOND } from "./clock.ts";
 import { analogX, analogY } from "./frame.ts";
 import { getHost, getOps, hostViewport, type HostOps } from "./host.ts";
 import { get as pakGet } from "./pak.ts";
 import type { NodeMirror } from "./renderer.ts";
+import type { SurfaceId } from "./display.ts";
 
 let root: NodeMirror | null = null;
 let focused: NodeMirror | null = null;
@@ -285,7 +286,11 @@ function moveFocus(direction: FocusDirection): void {
 }
 
 function firePress(): void {
-  let n: NodeMirror | null = focused;
+  firePressFrom(focused);
+}
+
+function firePressFrom(start: NodeMirror | null): void {
+  let n: NodeMirror | null = start;
   while (n) {
     if (n.onPress) {
       n.onPress();
@@ -293,6 +298,21 @@ function firePress(): void {
     }
     n = n.parent;
   }
+}
+
+/** Hold/clear the `active:` pressed variant from touch/gesture code. All
+ *  writers (d-pad, cursor, touch) route through the same internal latch, so
+ *  a pressed look can never strand across input modes. */
+export function setActiveNode(node: NodeMirror | null): void {
+  setPressedNode(node);
+}
+
+/** Focus a node and fire its onPress (bubbling to the nearest ancestor
+ *  handler) — the touch-tap equivalent of the CIRCLE press, so taps, d-pad,
+ *  and cursor clicks all land in the same handler. */
+export function pressNode(node: NodeMirror): void {
+  focusNode(node);
+  firePressFrom(node);
 }
 
 // ---- removal repair [R] ------------------------------------------------------
@@ -637,9 +657,14 @@ function findMirror(node: NodeMirror | null, id: number): NodeMirror | null {
  *  Injected by render() like the input root — overlay content (Portal
  *  menus, modals) paints above the app and must resolve under the cursor. */
 let hitRoot: NodeMirror | null = null;
+let auxiliaryHitRoot: NodeMirror | null = null;
 
 export function setHitRoot(r: NodeMirror | null): void {
   hitRoot = r;
+}
+
+export function setAuxiliaryHitRoot(r: NodeMirror | null): void {
+  auxiliaryHitRoot = r;
 }
 
 /** The interaction target for a raw hit: the nearest focusable ancestor
@@ -667,6 +692,61 @@ export function hitFocusable(x: number, y: number): NodeMirror | null {
   const ops = getOps();
   if (!ops.hitTest) return null;
   return cursorTarget(findMirror(hitRoot ?? root, ops.hitTest(x, y)));
+}
+
+/**
+ * Nearest activation target for a touch contact: the hit FACT (or its query
+ * fallback) walked up to the closest focusable in scope — the exact filter
+ * cursor hover uses, so "what a tap can press" and "what a click can press"
+ * are one authority. Null when nothing pressable owns the point.
+ */
+export function touchFocusable(
+  x: number,
+  y: number,
+  fact: number | undefined,
+  surface: SurfaceId = "primary",
+): NodeMirror | null {
+  return cursorTarget(resolveTouchHit(x, y, fact, surface));
+}
+
+/**
+ * Raw topmost-ink mirror under a screen point — hitFocusable without the
+ * focusable/scope filter. The gesture layer resolves region ownership with
+ * this (a pan region is rarely focusable itself). Null when the host has no
+ * hitTest op or nothing painted claims the point.
+ */
+export function hitNode(x: number, y: number, surface: SurfaceId = "primary"): NodeMirror | null {
+  const ops = getOps();
+  const query = surface === "auxiliary" ? ops.hitTestAuxiliary : ops.hitTest;
+  const searchRoot = surface === "auxiliary" ? auxiliaryHitRoot : hitRoot ?? root;
+  if (!query || !searchRoot) return null;
+  return findMirror(searchRoot, query(x, y));
+}
+
+/**
+ * Touch-path hit authority (docs/TOUCH.md). The host-delivered FACT wins when
+ * present (`TouchContact.hit` — resolved once at the contact's down edge and
+ * carried); otherwise ONE cold query, preferring the bounds op (42) and
+ * tolerating ink-only hosts (op 27). Null = nothing claimed / no channel at
+ * all — region rects are the caller's last resort.
+ */
+export function resolveTouchHit(
+  x: number,
+  y: number,
+  fact: number | undefined,
+  surface: SurfaceId = "primary",
+): NodeMirror | null {
+  const searchRoot = surface === "auxiliary" ? auxiliaryHitRoot : hitRoot ?? root;
+  if (!searchRoot) return null;
+  if (fact !== undefined) {
+    return fact === 0 ? null : findMirror(searchRoot, fact);
+  }
+  const ops = getOps();
+  const query = surface === "auxiliary"
+    ? ops.hitTestBoundsAuxiliary ?? ops.hitTestAuxiliary
+    : ops.hitTestBounds ?? ops.hitTest;
+  if (!query) return null;
+  return findMirror(searchRoot, query(x, y));
 }
 
 /** One cursor-mode frame. Returns false when the host predates the cursor
@@ -699,7 +779,7 @@ function cursorFrame(buttons: number, pressed: number, released: number): boolea
   }
   let moved = c.fresh;
   if (vx !== 0 || vy !== 0) {
-    const dt = ticksPerFrame() / 60;
+    const dt = ticksPerFrame() / TICKS_PER_SECOND;
     const nx = Math.min(Math.max(c.x + vx * dt, 0), c.vw - 1);
     const ny = Math.min(Math.max(c.y + vy * dt, 0), c.vh - 1);
     if (nx !== c.x || ny !== c.y) {

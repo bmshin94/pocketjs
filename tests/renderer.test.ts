@@ -27,6 +27,7 @@ import {
   detectHost,
   installHost,
   parseHexColor,
+  reportAppAction,
   type Host,
   type HostOps,
 } from "../framework/src/host.ts";
@@ -49,7 +50,11 @@ import {
   setStyleResolver,
   type NodeMirror,
 } from "../framework/src/renderer.ts";
-import { registerStyles, resetStyles, resolveStyle } from "../framework/src/styles.ts";
+import {
+  registerStyles,
+  resetStyles,
+  resolveStyle,
+} from "../framework/src/styles.ts";
 import {
   getFocused,
   focusNode,
@@ -59,10 +64,32 @@ import {
   resetInput,
   setInputRoot,
 } from "../framework/src/input.ts";
-import { mount as publicMount, render as publicRender } from "../framework/src/index.ts";
-import { pushButtonHandlerBlock, onButtonPress, onFrame } from "../framework/src/lifecycle.ts";
+import {
+  mount as publicMount,
+  render as publicRender,
+} from "../framework/src/index.ts";
+import {
+  pushButtonHandlerBlock,
+  onButtonPress,
+  onFrame,
+} from "../framework/src/lifecycle.ts";
 import { rootMirror } from "../framework/src/renderer.ts";
-import { ActionBar, ActionHandler, FocusGrid, Modal, Portal, Text, View } from "../framework/src/components.ts";
+import {
+  ActionBar,
+  ActionHandler,
+  AuxiliaryPortal,
+  AuxiliarySurface,
+  FocusGrid,
+  Modal,
+  Portal,
+  Text,
+  View,
+} from "../framework/src/components.ts";
+import { getAuxiliarySurfaceRoots } from "../framework/src/display.ts";
+import { ClassicButton, ClassicSheet } from "../framework/src/classic.ts";
+import { __runGestures, resetGestures, pushTouchBlock } from "../framework/src/gesture.ts";
+import { __packTouch, __setTouches, __resetTouches } from "../framework/src/touch.ts";
+import { __advanceClock, resetClock } from "../framework/src/clock.ts";
 import {
   DeepZoom,
   type DeepZoomGesture,
@@ -70,6 +97,7 @@ import {
   type TileDoc,
 } from "../framework/src/deepzoom.ts";
 import { resetPack } from "../framework/src/pak.ts";
+import { ResourceImage, pending, ready, failed, type ResourceState, type TextureResource } from "../framework/src/resource.ts";
 import { encodeImageEntry, pack } from "../framework/compiler/pak.ts";
 import {
   BTN,
@@ -171,6 +199,88 @@ function childIds(node: NodeMirror): number[] {
 let host: MockHost;
 let root: NodeMirror;
 
+test("classic buttons provide press, slide-out, disabled and cancelled feedback", () => {
+  resetGestures(); __resetTouches(); resetClock();
+  registerStyles({ "text-xs font-bold": 1 });
+  let clicked = 0, hit = 0;
+  host.ops.hitTestBounds = () => hit;
+  const [disabled, setDisabled] = createSignal(false);
+  const dispose = render(() => ClassicButton({ label: "Save", style: { width: 80, height: 24 },
+    get disabled() { return disabled(); }, onPress() { clicked++; },
+  }) as unknown as NodeMirror, root);
+  setInputRoot(root);
+  const button = root.children[0]; hit = button.id;
+  const pump = (down: boolean) => { __advanceClock(); __setTouches(down ? [__packTouch(0, 10, 10)] : []); __runGestures(); };
+  const changes = () => host.of("setProp").filter(call => call[1] === button.id && call[2] === PROP.gradFrom);
+  host.clear(); pump(true); expect(changes()).toHaveLength(1); expect(clicked).toBe(0);
+  pump(false); expect(changes()).toHaveLength(2); expect(clicked).toBe(1);
+  pump(true); hit = 0;
+  __advanceClock(); __setTouches([__packTouch(0, 100, 10)]); __runGestures();
+  pump(false); expect(clicked).toBe(1); // release outside cancels
+  hit = button.id; pump(true); setDisabled(true); pump(false); expect(clicked).toBe(1);
+  setDisabled(false); pump(true); const unblock = pushTouchBlock(); pump(false); unblock(); expect(clicked).toBe(1);
+  pump(true); pump(false); expect(clicked).toBe(2);
+  dispose(); resetGestures(); __resetTouches();
+});
+
+test("classic sheets animate natively and retain modality through close and reopen", () => {
+  resetGestures(); resetClock(); registerStyles({ "text-xs font-bold": 1, "text-xs": 2, "text-sm font-bold": 3 });
+  const [open, setOpen] = createSignal(false);
+  const modal: boolean[] = [];
+  const dispose = render(() => ClassicSheet({ get open() { return open(); }, title: "Discard?", actions: [],
+    onCancel() {}, onModalChange(value) { modal.push(value); },
+  }) as unknown as NodeMirror, root);
+  const frame = root.children[0], body = frame.children[1];
+  host.clear(); setOpen(true);
+  expect(modal).toEqual([true]);
+  expect(host.of("animate").some(c => c[1] === body.id && c[2] === PROP.translateY && c[3] === 0)).toBe(true);
+  setOpen(false); for (let i = 0; i < 4; i++) __advanceClock();
+  expect(modal).toEqual([true]);
+  setOpen(true); for (let i = 0; i < 15; i++) __advanceClock();
+  expect(modal).toEqual([true]); // stale closing deadline cannot hide a reopened sheet
+  setOpen(false); for (let i = 0; i < 12; i++) __advanceClock();
+  expect(modal).toEqual([true, false]);
+  setOpen(true); dispose();
+  expect(modal.at(-1)).toBe(false);
+  resetGestures(); resetClock();
+});
+
+test("resource images retain their layout through fallback, retry and borrowed texture replacement", () => {
+  const [state, setState] = createSignal<ResourceState<TextureResource>>(pending());
+  let skeletons = 0, frees = 0;
+  host.ops.freeTexture = () => { frees++; };
+  const dispose = render(() => ResourceImage({
+    state, style: { width: 256, height: 16, overflow: 1 },
+    fallback: () => { skeletons++; return Text({ children: "Skeleton" }); },
+    errorFallback: () => Text({ children: "Retry" }),
+  }) as unknown as NodeMirror, root);
+  const frame = root.children[0];
+  expect(skeletons).toBe(1);
+  expect(host.of("setImage")).toHaveLength(0);
+  host.clear();
+  setState(pending());
+  expect(skeletons).toBe(1);
+  // Handle zero is valid. The component never uploads or frees borrowed images.
+  setState(ready({ handle: 0, width: 256, height: 16 })); runSweep();
+  const image = frame.children[0];
+  expect(host.of("setImage")).toEqual([["setImage", image.id, 0]]);
+  host.clear();
+  setState(ready({ handle: 7, width: 256, height: 16 }));
+  expect(frame.children[0]).toBe(image);
+  expect(host.of("setImage")).toEqual([["setImage", image.id, 7]]);
+  host.clear();
+  setState(ready({ handle: 7, width: 256, height: 16 }));
+  expect(host.of("setImage")).toHaveLength(0);
+  setState(failed("offline")); runSweep();
+  expect(host.of("setText").some(call => call[2] === "Retry")).toBe(true);
+  setState(pending()); runSweep();
+  expect(skeletons).toBe(2);
+  expect(root.children[0]).toBe(frame);
+  expect(host.of("setProp").filter(call => call[1] === frame.id)).toHaveLength(0);
+  expect(host.of("uploadTexture")).toHaveLength(0);
+  dispose(); runSweep(); expect(frees).toBe(0);
+});
+
 beforeEach(() => {
   host = makeMockHost();
   installHost(host);
@@ -181,7 +291,11 @@ beforeEach(() => {
   resetInput();
   setStyleResolver(resolveStyle);
   root = freshRoot();
-  const g = globalThis as { ui?: HostOps; __pak?: ArrayBuffer; frame?: (buttons: number) => void };
+  const g = globalThis as {
+    ui?: HostOps;
+    __pak?: ArrayBuffer;
+    frame?: (buttons: number) => void;
+  };
   delete g.ui;
   delete g.__pak;
   delete g.frame;
@@ -195,16 +309,23 @@ describe("pak image formats", () => {
       {
         width: 2,
         height: 1,
-        rgba: new Uint8Array([
-          255, 0, 0, 255,
-          0, 0, 255, 255,
-        ]),
+        rgba: new Uint8Array([255, 0, 0, 255, 0, 0, 255, 255]),
       },
       PSM.PSM_5650,
     );
     expect(Array.from(image)).toEqual([
-      2, 0, 1, 0, PSM.PSM_5650, 0, 0, 0,
-      0x1f, 0x00, 0x00, 0xf8,
+      2,
+      0,
+      1,
+      0,
+      PSM.PSM_5650,
+      0,
+      0,
+      0,
+      0x1f,
+      0x00,
+      0x00,
+      0xf8,
     ]);
 
     expect(() =>
@@ -249,6 +370,72 @@ describe("basic mount", () => {
 });
 
 describe("<For> reorder — DOM move semantics [R]", () => {
+  test("rejects a foreign anchor before mutating either tree", () => {
+    const parent = createElement("view");
+    const other = createElement("view");
+    const node = createElement("view");
+    const anchor = createElement("view");
+    insertNode(root, parent);
+    insertNode(root, other);
+    insertNode(parent, node);
+    insertNode(other, anchor);
+    host.clear();
+
+    expect(() => insertNode(parent, node, anchor)).toThrow(
+      "PocketJS: insert anchor is not a child of parent",
+    );
+    expect(node.parent).toBe(parent);
+    expect(childIds(parent)).toEqual([node.id]);
+    expect(host.of("insertBefore", "removeChild")).toEqual([]);
+  });
+
+  test("pure reverse never anchors a node on itself (DOM pre-insertion)", () => {
+    interface Row {
+      id: number;
+    }
+    const first: Row[] = Array.from({ length: 6 }, (_, i) => ({ id: i + 1 }));
+    const [rows, setRows] = createSignal(first);
+    const byId = new Map<number, NodeMirror>();
+    const dispose = render(
+      () =>
+        comp(For, {
+          get each() {
+            return rows();
+          },
+          children: (row: Row) => {
+            const el = createElement("view");
+            byId.set(row.id, el);
+            return el;
+          },
+        }),
+      root,
+    );
+    runSweep();
+    host.clear();
+
+    setRows([...first].reverse());
+    runSweep();
+    expect(childIds(root)).toEqual(
+      [6, 5, 4, 3, 2, 1].map((id) => byId.get(id)!.id),
+    );
+    for (const call of host.of("insertBefore")) {
+      expect(call[2]).not.toBe(call[3]);
+    }
+    expect(host.of("createNode")).toEqual([]);
+    expect(host.of("destroyNode")).toEqual([]);
+
+    // Exercise the update-then-reverse shape used by the external benchmark.
+    const second = first.map((row, i) => (i === 2 ? { id: 99 } : row));
+    setRows(second);
+    runSweep();
+    setRows([...second].reverse());
+    runSweep();
+    expect(childIds(root)).toEqual(
+      [...second].reverse().map((row) => byId.get(row.id)!.id),
+    );
+    dispose();
+  });
+
   test("reorder moves nodes without duplicates and without destroys", () => {
     const [items, setItems] = createSignal(["a", "b", "c"]);
     const byLabel = new Map<string, NodeMirror>();
@@ -286,6 +473,43 @@ describe("<For> reorder — DOM move semantics [R]", () => {
       expect([a.id, b.id, c.id]).toContain(call[2] as number);
     }
     // sweep at frame end: nothing was left detached, so nothing is destroyed
+    runSweep();
+    expect(host.of("destroyNode")).toEqual([]);
+
+    dispose();
+  });
+
+  test("an adjacent swap is a move too (insertBefore(node, node) is a no-op)", () => {
+    // Solid's reconcileArrays swaps [a, b] by inserting b before a.nextSibling
+    // — which is b itself. The DOM leaves the node in place; so must we,
+    // instead of unlinking b and then failing to find it as the anchor.
+    const [items, setItems] = createSignal(["a", "b", "c"]);
+    const byLabel = new Map<string, NodeMirror>();
+
+    const dispose = render(
+      () =>
+        comp(For, {
+          get each() {
+            return items();
+          },
+          children: (item: string) => {
+            const el = createElement("view");
+            byLabel.set(item, el);
+            return el;
+          },
+        }),
+      root,
+    );
+
+    const [a, b, c] = [byLabel.get("a")!, byLabel.get("b")!, byLabel.get("c")!];
+    host.clear();
+    setItems(["b", "a", "c"]);
+    expect(childIds(root)).toEqual([b.id, a.id, c.id]);
+    expect(new Set(childIds(root)).size).toBe(3);
+    expect(host.of("createNode")).toEqual([]);
+    expect(host.of("destroyNode")).toEqual([]);
+    setItems(["b", "c", "a"]);
+    expect(childIds(root)).toEqual([b.id, c.id, a.id]);
     runSweep();
     expect(host.of("destroyNode")).toEqual([]);
 
@@ -514,7 +738,9 @@ describe("setProperty dispatch table [R]", () => {
     expect(resolveStyle("p-2 px-4 m-1")).toBe(2);
     expect(resolveStyle("px-4 m-1 p-2")).toBeUndefined();
     const el = createElement("view");
-    expect(() => setProp(el, "class", "px-4 m-1 p-2", undefined)).toThrow(/unknown class/);
+    expect(() => setProp(el, "class", "px-4 m-1 p-2", undefined)).toThrow(
+      /unknown class/,
+    );
     // Commutative anagrams (same record => same id) keep aliasing.
     registerStyles({ "bg-red p-2": 7, "p-2 bg-red": 7 });
     expect(resolveStyle("p-2 bg-red")).toBe(7);
@@ -821,6 +1047,21 @@ describe("focus + onPress (input.ts)", () => {
 });
 
 describe("host detection (host.ts)", () => {
+  test("reports completed app actions only when the host provides an acceptance sink", () => {
+    const reports: Array<[string, number]> = [];
+    host.ops.__reportAppAction = (name, value) => reports.push([name, value]);
+
+    reportAppAction("hero_tap", 1);
+    expect(reports).toEqual([["hero_tap", 1]]);
+
+    delete host.ops.__reportAppAction;
+    expect(() => reportAppAction("hero_tap", 2)).not.toThrow();
+    expect(() => reportAppAction("Hero tap", 3)).toThrow(/app action names/);
+    expect(() => reportAppAction("hero_tap", 0x80000000)).toThrow(
+      /signed 32-bit/,
+    );
+  });
+
   test("resolved build contract rejects the wrong native target or ABI", () => {
     const ops = makeMockHost().ops;
     ops.__host = "vita";
@@ -846,15 +1087,52 @@ describe("host detection (host.ts)", () => {
     ).toThrow(/ABI mismatch/);
   });
 
+  test("tick-rate pairing: bundle-baked hz must match the host's declared rate", () => {
+    const ops = makeMockHost().ops;
+
+    // A 60-baked bundle accepts hosts that predate __tickHz (they only ever
+    // ran 60) and hosts that declare 60 — with or without a plan contract.
+    expect(() => assertNativeHostContract(ops, null)).not.toThrow();
+    ops.__tickHz = 60;
+    expect(() => assertNativeHostContract(ops, null)).not.toThrow();
+
+    // A host driving another rate is refused even when the plan matches.
+    ops.__host = "vita";
+    ops.__hostAbi = 1;
+    ops.__tickHz = 120;
+    expect(() =>
+      assertNativeHostContract(ops, { target: "vita", hostAbi: 1 }),
+    ).toThrow(/tick-rate mismatch/);
+
+    // A non-60 bundle (the define is read at call time — see host.ts) needs
+    // the host to declare that exact rate; silence means the 60 default.
+    const globals = globalThis as { __POCKET_TICK_HZ__?: number };
+    try {
+      globals.__POCKET_TICK_HZ__ = 120;
+      expect(() => assertNativeHostContract(ops, null)).not.toThrow();
+      delete ops.__tickHz;
+      expect(() => assertNativeHostContract(ops, null)).toThrow(
+        /declares no ui\.__tickHz/,
+      );
+      ops.__tickHz = 60;
+      expect(() => assertNativeHostContract(ops, null)).toThrow(
+        /tick-rate mismatch/,
+      );
+    } finally {
+      delete globals.__POCKET_TICK_HZ__;
+    }
+  });
+
   test("native namespace passed explicitly stays native / non-strict", () => {
     // Demo entries pass globalThis.ui to render(); object identity must keep
     // the namespace native instead of turning it into an
     // injected/strict host (crash-on-miss on hardware + double asset feed).
     const psp = makeMockHost();
     psp.ops.__host = "psp";
-    (psp.ops as HostOps & { __textures?: Record<string, number> }).__textures = {
-      "logo.png": 0,
-    };
+    (psp.ops as HostOps & { __textures?: Record<string, number> }).__textures =
+      {
+        "logo.png": 0,
+      };
     const g = globalThis as { ui?: HostOps };
     g.ui = psp.ops;
     try {
@@ -868,7 +1146,9 @@ describe("host detection (host.ts)", () => {
         ops: psp.ops,
         styles: { "p-2": 0 },
       });
-      expect(psp.of("loadStyles", "loadFontAtlas", "uploadTexture")).toEqual([]);
+      expect(psp.of("loadStyles", "loadFontAtlas", "uploadTexture")).toEqual(
+        [],
+      );
       dispose();
     } finally {
       delete g.ui;
@@ -881,21 +1161,31 @@ describe("host detection (host.ts)", () => {
     symbian.ops.__hostAbi = 4;
     const g = globalThis as { ui?: HostOps; __pak?: ArrayBuffer };
     const pak = pack([
-      { key: "ui:styles", dtype: PAK_DTYPE.u8, data: new Uint8Array([1, 2, 3]) },
-      { key: "ui:font.0", dtype: PAK_DTYPE.u8, data: new Uint8Array([4, 5, 6]) },
+      {
+        key: "ui:styles",
+        dtype: PAK_DTYPE.u8,
+        data: new Uint8Array([1, 2, 3]),
+      },
+      {
+        key: "ui:font.0",
+        dtype: PAK_DTYPE.u8,
+        data: new Uint8Array([4, 5, 6]),
+      },
     ]);
     g.ui = symbian.ops;
-    g.__pak = pak.buffer.slice(pak.byteOffset, pak.byteOffset + pak.byteLength) as ArrayBuffer;
+    g.__pak = pak.buffer.slice(
+      pak.byteOffset,
+      pak.byteOffset + pak.byteLength,
+    ) as ArrayBuffer;
     try {
       const dispose = publicRender(() => createElement("view"), {
         ops: symbian.ops,
         styles: {},
       });
       expect(detectHost(symbian.ops).kind).toBe("native");
-      expect(symbian.of("loadStyles", "loadFontAtlas").map(([name]) => name)).toEqual([
-        "loadFontAtlas",
-        "loadStyles",
-      ]);
+      expect(
+        symbian.of("loadStyles", "loadFontAtlas").map(([name]) => name),
+      ).toEqual(["loadFontAtlas", "loadStyles"]);
       dispose();
     } finally {
       delete g.ui;
@@ -977,7 +1267,10 @@ describe("public render() (index.ts)", () => {
     dispose();
     expect(rootMirror.children.length).toBe(0);
     // layer roots are destroyed once each (native destroy recurses).
-    expect(host.of("destroyNode").map((c) => c[1])).toEqual([appLayer.id, overlayLayer.id]);
+    expect(host.of("destroyNode").map((c) => c[1])).toEqual([
+      appLayer.id,
+      overlayLayer.id,
+    ]);
   });
 
   test("native resize hook reflows a live tree without remounting or losing state", () => {
@@ -988,13 +1281,16 @@ describe("public render() (index.ts)", () => {
     ops.__viewport = { w: 640, h: 360 };
     const [count, setCount] = createSignal(7);
 
-    const dispose = publicRender(() => {
-      const content = createElement("view");
-      const label = createElement("text");
-      insert(label, () => `count:${count()}`);
-      insertNode(content, label);
-      return content;
-    }, { ops });
+    const dispose = publicRender(
+      () => {
+        const content = createElement("view");
+        const label = createElement("text");
+        insert(label, () => `count:${count()}`);
+        insertNode(content, label);
+        return content;
+      },
+      { ops },
+    );
     const [appLayer, overlayLayer] = rootMirror.children;
     const content = appLayer.children[0];
     const label = content.children[0];
@@ -1010,20 +1306,28 @@ describe("public render() (index.ts)", () => {
     expect(content.children[0]).toBe(label);
     expect(label.children[0]).toBe(dynamicText);
     expect(dynamicText.text).toBe("count:7");
-    expect(host.of("setProp")).toEqual(expect.arrayContaining([
-      ["setProp", appLayer.id, PROP.width, 360],
-      ["setProp", appLayer.id, PROP.height, 640],
-      ["setProp", overlayLayer.id, PROP.width, 360],
-      ["setProp", overlayLayer.id, PROP.height, 640],
-    ]));
-    expect(host.of("createNode", "destroyNode", "insertBefore", "removeChild")).toEqual([]);
+    expect(host.of("setProp")).toEqual(
+      expect.arrayContaining([
+        ["setProp", appLayer.id, PROP.width, 360],
+        ["setProp", appLayer.id, PROP.height, 640],
+        ["setProp", overlayLayer.id, PROP.width, 360],
+        ["setProp", overlayLayer.id, PROP.height, 640],
+      ]),
+    );
+    expect(
+      host.of("createNode", "destroyNode", "insertBefore", "removeChild"),
+    ).toEqual([]);
 
     host.clear();
     setCount(8);
     expect(label.children[0]).toBe(dynamicText);
     expect(dynamicText.text).toBe("count:8");
-    expect(host.of("replaceText")).toEqual([["replaceText", dynamicText.id, "count:8"]]);
-    expect(host.of("createNode", "destroyNode", "insertBefore", "removeChild")).toEqual([]);
+    expect(host.of("replaceText")).toEqual([
+      ["replaceText", dynamicText.id, "count:8"],
+    ]);
+    expect(
+      host.of("createNode", "destroyNode", "insertBefore", "removeChild"),
+    ).toEqual([]);
 
     dispose();
     expect(globals.__pocketResizeViewport).toBeUndefined();
@@ -1039,14 +1343,16 @@ describe("public render() (index.ts)", () => {
       h: 500,
       bg: 0xff202020,
       tile: 100,
-      levels: [{
-        scale: 1,
-        cols: 10,
-        rows: 5,
-        key: "ui:tile.live-viewport",
-        grid: Array<string>(5).fill("aaaaaaaaaa"),
-        solids: [0xff808080],
-      }],
+      levels: [
+        {
+          scale: 1,
+          cols: 10,
+          rows: 5,
+          key: "ui:tile.live-viewport",
+          grid: Array<string>(5).fill("aaaaaaaaaa"),
+          solids: [0xff808080],
+        },
+      ],
     };
     const views: DeepZoomView[] = [];
     let gesture: DeepZoomGesture | null = null;
@@ -1075,10 +1381,12 @@ describe("public render() (index.ts)", () => {
     frame();
     expect(views.at(-1)?.minZoom).toBeCloseTo(0.36);
     expect(views.at(-1)?.zoom).toBeCloseTo(0.36);
-    expect(host.of("setProp")).toEqual(expect.arrayContaining([
-      ["setProp", container.id, PROP.width, 360],
-      ["setProp", container.id, PROP.height, 640],
-    ]));
+    expect(host.of("setProp")).toEqual(
+      expect.arrayContaining([
+        ["setProp", container.id, PROP.width, 360],
+        ["setProp", container.id, PROP.height, 640],
+      ]),
+    );
     expect(rootMirror.children[0].children[0]).toBe(container);
     expect(container.children[1]).toBe(activeWorld);
 
@@ -1112,14 +1420,16 @@ describe("public render() (index.ts)", () => {
       h: 500,
       bg: 0xff202020,
       tile: 100,
-      levels: [{
-        scale: 1,
-        cols: 10,
-        rows: 5,
-        key: "ui:tile.fixed-viewport",
-        grid: Array<string>(5).fill("aaaaaaaaaa"),
-        solids: [0xff808080],
-      }],
+      levels: [
+        {
+          scale: 1,
+          cols: 10,
+          rows: 5,
+          key: "ui:tile.fixed-viewport",
+          grid: Array<string>(5).fill("aaaaaaaaaa"),
+          solids: [0xff808080],
+        },
+      ],
     };
     ops.__viewport = { w: 640, h: 360 };
 
@@ -1147,10 +1457,13 @@ describe("public render() (index.ts)", () => {
     expect(views.at(-1)?.minZoom).toBeCloseTo(0.48);
     expect(views.at(-1)?.zoom).toBeCloseTo(0.48);
     expect(
-      host.of("setProp").filter((call) =>
-        call[1] === container.id &&
-        (call[2] === PROP.width || call[2] === PROP.height)
-      ),
+      host
+        .of("setProp")
+        .filter(
+          (call) =>
+            call[1] === container.id &&
+            (call[2] === PROP.width || call[2] === PROP.height),
+        ),
     ).toEqual([]);
 
     dispose();
@@ -1174,6 +1487,53 @@ describe("public render() (index.ts)", () => {
     expect(appLayer.children[0].children.length).toBe(1);
     expect(overlayLayer.children[0].children.length).toBe(1);
 
+    dispose();
+  });
+
+  test("AuxiliarySurface mounts under a host-owned independent root", () => {
+    host.ops.__auxiliarySurface = { root: 99, w: 320, h: 240 };
+    host.alive.add(99);
+    const dispose = publicRender(
+      () =>
+        View({
+          children: [
+            Text({ children: "primary" }),
+            AuxiliarySurface({ children: () => Text({ children: "auxiliary" }) }),
+          ],
+        }),
+      { ops: host.ops },
+    );
+
+    const surface = getAuxiliarySurfaceRoots();
+    expect(surface.native.id).toBe(99);
+    expect(surface.native.parent).toBeNull();
+    expect(surface.viewport).toEqual({ width: 320, height: 240 });
+    expect(surface.app.children).toHaveLength(1);
+    expect(surface.app.children[0].children).toHaveLength(1);
+    expect(rootMirror.children).toHaveLength(2);
+
+    host.clear();
+    dispose();
+    expect(host.of("destroyNode").some((call) => call[1] === 99)).toBe(false);
+  });
+
+  test("AuxiliaryPortal mounts above the independent auxiliary app layer", () => {
+    host.ops.__auxiliarySurface = { root: 99, w: 320, h: 240 };
+    host.alive.add(99);
+    const dispose = publicRender(
+      () =>
+        View({
+          children: [
+            AuxiliarySurface({ children: () => Text({ children: "app" }) }),
+            AuxiliaryPortal({ children: () => Text({ children: "overlay" }) }),
+          ],
+        }),
+      { ops: host.ops },
+    );
+
+    const surface = getAuxiliarySurfaceRoots();
+    expect(surface.app.children[0].children[0].children[0].text).toBe("app");
+    expect(surface.overlay.children[0].children[0].children[0].text).toBe("overlay");
     dispose();
   });
 
@@ -1238,7 +1598,9 @@ describe("public render() (index.ts)", () => {
     expect(host.of("removeChild")).toEqual([]);
     expect(host.of("destroyNode")).toEqual([]);
     expect(host.of("animate")).toEqual([]);
-    expect(host.of("setProp").map((call) => [call[1], call[2], call[3]])).toEqual(
+    expect(
+      host.of("setProp").map((call) => [call[1], call[2], call[3]]),
+    ).toEqual(
       expect.arrayContaining([
         [backdrop.id, PROP.opacity, 0],
         [panel.id, PROP.opacity, 0],
@@ -1253,7 +1615,9 @@ describe("public render() (index.ts)", () => {
     expect(host.of("removeChild")).toEqual([]);
     expect(host.of("destroyNode")).toEqual([]);
     expect(host.of("animate")).toEqual([]);
-    expect(host.of("setProp").map((call) => [call[1], call[2], call[3]])).toEqual(
+    expect(
+      host.of("setProp").map((call) => [call[1], call[2], call[3]]),
+    ).toEqual(
       expect.arrayContaining([
         [backdrop.id, PROP.opacity, 0.62],
         [panel.id, PROP.opacity, 1],
@@ -1278,7 +1642,10 @@ describe("public render() (index.ts)", () => {
               open: false,
               class: "modal-frame",
               panelClass: "modal-panel",
-              children: View({ ref: (node) => (hiddenModalItem = node), focusable: true }),
+              children: View({
+                ref: (node) => (hiddenModalItem = node),
+                focusable: true,
+              }),
             }),
           ],
         }),
@@ -1334,24 +1701,31 @@ describe("public render() (index.ts)", () => {
   });
 
   test("mount() hides host, pak image, and frame boilerplate", () => {
-    const g = globalThis as { ui?: HostOps; __pak?: ArrayBuffer; frame?: (buttons: number) => void };
+    const g = globalThis as {
+      ui?: HostOps;
+      __pak?: ArrayBuffer;
+      frame?: (buttons: number) => void;
+    };
     g.ui = host.ops;
     const image = encodeImageEntry(
       { width: 1, height: 1, rgba: new Uint8Array([10, 20, 30, 255]) },
       PSM.PSM_8888,
     );
-    const pak = pack([{ key: "ui:img.logo.png", dtype: PAK_DTYPE.u8, data: image }]);
-    g.__pak = pak.buffer.slice(pak.byteOffset, pak.byteOffset + pak.byteLength) as ArrayBuffer;
+    const pak = pack([
+      { key: "ui:img.logo.png", dtype: PAK_DTYPE.u8, data: image },
+    ]);
+    g.__pak = pak.buffer.slice(
+      pak.byteOffset,
+      pak.byteOffset + pak.byteLength,
+    ) as ArrayBuffer;
 
     const before: number[] = [];
-    const dispose = publicMount(
-      () => {
-        onFrame((buttons) => before.push(buttons));
-        const img = createElement("image");
-        setProp(img, "src", "logo.png", undefined);
-        return img;
-      },
-    );
+    const dispose = publicMount(() => {
+      onFrame((buttons) => before.push(buttons));
+      const img = createElement("image");
+      setProp(img, "src", "logo.png", undefined);
+      return img;
+    });
 
     expect(host.of("uploadTexture")).toEqual([["uploadTexture"]]);
     expect(host.of("setImage").length).toBe(1);
@@ -1374,8 +1748,13 @@ describe("public render() (index.ts)", () => {
       PSM.PSM_8888,
       IMG_FLAG_LINEAR,
     );
-    const pak = pack([{ key: "ui:img.logo.png", dtype: PAK_DTYPE.u8, data: image }]);
-    g.__pak = pak.buffer.slice(pak.byteOffset, pak.byteOffset + pak.byteLength) as ArrayBuffer;
+    const pak = pack([
+      { key: "ui:img.logo.png", dtype: PAK_DTYPE.u8, data: image },
+    ]);
+    g.__pak = pak.buffer.slice(
+      pak.byteOffset,
+      pak.byteOffset + pak.byteLength,
+    ) as ArrayBuffer;
 
     const dispose = publicMount(() => createElement("view"));
 
@@ -1394,14 +1773,14 @@ describe("public render() (index.ts)", () => {
     let backgroundPresses = 0;
     let systemPresses = 0;
 
-    const dispose = publicMount(
-      () => {
-        onFrame(() => frames++);
-        onButtonPress(BTN.SELECT, () => backgroundPresses++);
-        onButtonPress(BTN.SELECT, () => systemPresses++, { allowWhenBlocked: true });
-        return createElement("view");
-      },
-    );
+    const dispose = publicMount(() => {
+      onFrame(() => frames++);
+      onButtonPress(BTN.SELECT, () => backgroundPresses++);
+      onButtonPress(BTN.SELECT, () => systemPresses++, {
+        allowWhenBlocked: true,
+      });
+      return createElement("view");
+    });
     const unblock = pushButtonHandlerBlock();
 
     g.frame?.(BTN.SELECT);
@@ -1425,15 +1804,14 @@ describe("public render() (index.ts)", () => {
     g.ui = host.ops;
     let presses = 0;
 
-    const dispose = publicMount(
-      () =>
-        View({
-          children: ActionHandler({
-            button: BTN.SELECT,
-            active: enabled,
-            onPress: () => presses++,
-          }),
+    const dispose = publicMount(() =>
+      View({
+        children: ActionHandler({
+          button: BTN.SELECT,
+          active: enabled,
+          onPress: () => presses++,
         }),
+      }),
     );
 
     g.frame?.(BTN.SELECT);
@@ -1455,15 +1833,14 @@ describe("public render() (index.ts)", () => {
     g.ui = host.ops;
     let presses = 0;
 
-    const dispose = publicMount(
-      () =>
-        View({
-          children: ActionHandler({
-            button: BTN.SELECT,
-            latched: true,
-            onPress: () => presses++,
-          }),
+    const dispose = publicMount(() =>
+      View({
+        children: ActionHandler({
+          button: BTN.SELECT,
+          latched: true,
+          onPress: () => presses++,
         }),
+      }),
     );
 
     g.frame?.(BTN.SELECT);

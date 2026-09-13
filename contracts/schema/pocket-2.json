@@ -119,8 +119,65 @@
         "framework": {
           "enum": [
             "solid",
-            "vue-vapor"
+            "vue-vapor",
+            "octane"
           ]
+        },
+        "surfaces": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "auxiliary"
+          ],
+          "properties": {
+            "auxiliary": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "fixed"
+              ],
+              "properties": {
+                "fixed": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "logical",
+                    "presentation"
+                  ],
+                  "properties": {
+                    "logical": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "minItems": 2,
+                      "maxItems": 2
+                    },
+                    "presentation": {
+                      "enum": [
+                        "fill",
+                        "fit",
+                        "integer-fit",
+                        "native",
+                        "stretch"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "companions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "uniqueItems": true
         },
         "viewport": {
           "anyOf": [
