@@ -222,22 +222,21 @@ export function createFontArchive(
         pending.delete(id);
         if (token !== serial) return;
         keys.forEach((k) => inflight.delete(k));
+        let delay = 30;
         if (result.ok) {
           try {
             status.loaded += host.fontStreamCommit!(decodeHex(result.value));
             status.error = "";
           } catch (e) {
             status.error = String(e);
-            keys.forEach((k) => retry.set(k, frame + 60));
+            delay = 60;
           }
         } else {
           status.error = result.error;
-          keys.forEach((k) => retry.set(k, frame + 60));
+          delay = 60;
         }
         // A full pinned cache must not keep fetching the same rejected misses.
-        keys.forEach((k) => {
-          if (!retry.has(k)) retry.set(k, frame + 30);
-        });
+        keys.forEach((k) => retry.set(k, frame + delay));
         if (retry.size > 2048) retry.clear();
         changed();
       },

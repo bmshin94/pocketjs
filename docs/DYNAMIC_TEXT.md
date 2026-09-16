@@ -42,8 +42,9 @@ single-thread allocator.
 
 **Only glyphs that survive viewport and clip rejection create demand.** The
 framework schedules at most two pending glyph batches and consumes at most one
-reply per frame. Source coverage is capped at 2 MiB across streamed slots, with
-at most 1024 extra glyphs per slot. Resident glyphs painted in the last frame
+reply per frame. Additional resident glyph cells are capped at 2 MiB across streamed slots, with
+at most 1024 extra glyphs per slot. The byte counter reports these reserved cells;
+packaged glyphs and their padding use separate storage. Resident glyphs painted in the last frame
 remain pinned. New pages replace unused glyphs by last use; a full pinned cache
 rejects an insertion and preserves the characters already on screen. An
 unsupported scalar uses the missing-glyph cell and a bounded negative cache.
