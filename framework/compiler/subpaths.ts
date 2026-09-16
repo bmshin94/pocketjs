@@ -124,7 +124,12 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   net: { file: "framework/src/net-api.ts", aliases: TWINS },
   osk: { file: { solid: "framework/src/osk.tsx" } },
   package: { file: "contracts/spec/pocket-package.ts" },
+  "service-client": { file: "framework/src/service-client.ts" },
+  "media-service": { file: "framework/src/media-service.ts" },
   platform: { file: "framework/src/platform.ts" },
+  modality: { file: "framework/src/modality.ts" },
+  actions: { file: { solid: "framework/src/actions.ts" } },
+  system: { file: { solid: "framework/src/system.ts" } },
   "vita-package": { file: "tools/vita-package.ts" },
   prelude: {
     file: {
