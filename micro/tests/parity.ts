@@ -52,12 +52,11 @@ export function tapeFor(spec: (typeof GOLDEN_SPECS)[number]): string {
 export async function runParity(appName: string, out: string): Promise<ParityResult> {
   const spec = GOLDEN_SPECS.find((s) => (s.app ?? s.name) === `${appName}-main` || s.name === appName);
   if (!spec) throw new Error(`no golden spec for ${appName}`);
-  const dist = join(out, "dist");
-  const gen = join(out, "gen");
-  await $`bun micro/compiler/cli.ts build ${appName} --out ${dist} --gen ${gen}`.cwd(ROOT).quiet();
+  const dist = join(out, "build");
+  await $`bun micro/compiler/cli.ts build ${appName} --out ${dist}`.cwd(ROOT).quiet();
   const harnessDir = join(ROOT, "micro/harness");
   const targetDir = join(ROOT, ".pocket-build/validation/pocket-micro/harness-target");
-  const env = { ...process.env, POCKET_MICRO_APP_RS: join(gen, "app.rs"), CARGO_TARGET_DIR: targetDir };
+  const env = { ...process.env, POCKET_MICRO_APP_RS: join(dist, "app.rs"), CARGO_TARGET_DIR: targetDir };
   const build = Bun.spawnSync(["cargo", "build", "--quiet"], { cwd: harnessDir, env, stdout: "pipe", stderr: "pipe" });
   await Bun.write(join(out, "cargo-build.log"), build.stdout.toString() + build.stderr.toString());
   if (build.exitCode !== 0) throw new Error(`harness build failed:\n${build.stderr.toString()}`);

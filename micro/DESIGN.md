@@ -108,12 +108,11 @@ What a JS runtime resolves per frame, the frontend resolves once:
 ## 4. Micro IR
 
 The IR is JSON data typed in `micro/compiler/ir.ts`; `bun micro/compiler/
-cli.ts ir hero` prints it and `apps/hero/micro/gen/app.ir.json` is committed
-next to the Rust. TypeScript types plus a JSON form were chosen over a Rust
-or binary IR because the frontend already lives on the TypeScript compiler
+cli.ts ir hero` prints it. TypeScript types plus a JSON form were chosen over
+a Rust or binary IR because the frontend already lives on the TypeScript compiler
 API (the same choice Vapor and #428 made), the IR is inspected and asserted
-in `bun test`, and a second backend (a C emitter for a Vapor-class console)
-consumes the same file.
+in `bun test`, and a second backend, say a C emitter for a Vapor-class
+console, consumes the same structure.
 
 ```
 Program   title, entry, module, component
@@ -196,14 +195,26 @@ apps/hero/main.tsx + app.tsx
    │ micro/compiler/frontend.ts   subset check, prop folding, component inlining,
    │                              signal numbering, int/num fixpoint, template lowering
    ▼
-Micro IR (app.ir.json)
-   ├─ micro/compiler/emit-rust.ts  → apps/hero/micro/gen/app.rs   (committed)
+Micro IR
+   ├─ micro/compiler/emit-rust.ts  → dist/micro/hero/app.rs
    └─ micro/compiler/assets.ts     → dist/micro/hero/hero.pak      (styles.bin, atlases, images, sprites;
                                                                     framework/compiler tailwind + bake-font + pak)
    ▼
 hosts/psp-micro (cargo psp)        → pocket-micro-psp.prx / EBOOT.PBP
 micro/harness (cargo)              → frame dumps for parity
 ```
+
+**Nothing generated is committed.** `app.rs`, the IR, the pak, `styles.bin`
+and the manifest are pure functions of the app sources and this compiler, so
+they are built on demand into ignored `dist/micro/<app>/`; `hosts/psp-micro/
+build.rs` takes their paths through `POCKET_MICRO_APP_RS` and
+`POCKET_MICRO_PAK`. A checked-in copy would be a second source of truth that
+review has to diff and CI has to re-verify, and it would put machine output
+in the app's source directory. What guards the emitter instead is the parity
+test, which compiles its output and compares pixels, plus emitter assertions
+in `micro/tests/compiler.test.ts`. The build identity in every device receipt
+is the sha256 of the compiled module and its pak, so a stale binary on the
+device announces itself.
 
 `bun micro/compiler/cli.ts build hero --psp --release --tape "<frame:mask,…>"`
 bakes a button tape (the capture-build format) so a device run replays the
@@ -232,9 +243,10 @@ committed `tests/goldens/web/hero-main.*.png` differ from both in the
 touched by this change.
 
 **Hardware.** Same tape on a PSP over PSPLINK (`micro/scripts/psplink.ts`),
-release builds, 333 MHz, 60 Hz. Build `9b9f64334eb5f9a3` is the committed
-`app.rs` plus its pak; the QuickJS numbers come from the stock EBOOT's
-`--bench` receipt with the same tape baked as its capture input.
+release builds, 333 MHz, 60 Hz. Build `9b9f64334eb5f9a3` names the compiled
+module plus its pak; the EBOOT reports it in every receipt, so a stale binary
+announces itself. The QuickJS numbers come from the stock EBOOT's `--bench`
+receipt with the same tape baked as its capture input.
 
 | | QuickJS host (`pocketjs-psp`, `--bench`) | Pocket Micro (`pocket-micro-psp`) |
 |---|---|---|

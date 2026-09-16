@@ -6,8 +6,10 @@
 //   bun micro/compiler/cli.ts build <app> [options]    IR + Rust + pak (+ PSP EBOOT)
 //
 //   <app>            apps/<app>/main.tsx, or a path to a mounting entry
-//   --gen <dir>      generated Rust/IR directory (default apps/<app>/micro/gen)
-//   --out <dir>      pak/manifest directory (default dist/micro/<app>)
+//   --out <dir>      build directory (default dist/micro/<app>): app.rs,
+//                    app.ir.json, the pak, styles.bin and manifest.json.
+//                    Nothing here is committed; every artifact is a pure
+//                    function of the app sources and this compiler.
 //   --psp            build hosts/psp-micro into a PRX + EBOOT.PBP (cargo psp)
 //   --release        cargo --release for --psp
 //   --tape "<f:m,…>" bake a button tape into the EBOOT (frame:mask, as the
@@ -28,7 +30,7 @@ const ROOT = resolve(new URL("../..", import.meta.url).pathname);
 
 function usage(): never {
   console.error(
-    "usage: bun micro/compiler/cli.ts <ir|check|build> <app> [--gen <dir>] [--out <dir>] [--psp] [--release] [--tape <frame:mask,…>] [--receipt <frame>]",
+    "usage: bun micro/compiler/cli.ts <ir|check|build> <app> [--out <dir>] [--psp] [--release] [--tape <frame:mask,…>] [--receipt <frame>]",
   );
   process.exit(2);
 }
@@ -36,7 +38,7 @@ function usage(): never {
 const argv = process.argv.slice(2);
 const command = argv[0];
 if (!command || !["ir", "check", "build"].includes(command)) usage();
-const positional = argv.slice(1).filter((a, i, all) => !a.startsWith("--") && !(i > 0 && ["--gen", "--out", "--tape", "--receipt"].includes(all[i - 1])));
+const positional = argv.slice(1).filter((a, i, all) => !a.startsWith("--") && !(i > 0 && ["--out", "--tape", "--receipt"].includes(all[i - 1])));
 const flag = (name: string): string | undefined => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
@@ -72,7 +74,6 @@ if (command === "ir") {
   process.exit(0);
 }
 
-const genDir = resolve(flag("--gen") ?? join(appDir, "micro/gen"));
 const outDir = resolve(flag("--out") ?? join(ROOT, "dist/micro", appName));
 console.log(`Pocket Micro: ${appName} (${program.entry})`);
 const assets = await buildAssets(program, appDir, ROOT, (line) => {
@@ -82,10 +83,9 @@ console.log(planSummary(program, assets.styles.records.length, assets.styles.use
 if (command === "check") process.exit(0);
 
 const rust = emitRust(program, { styleIds: assets.styles.ids, fontSlots: assets.styles.usedFontSlots });
-mkdirSync(genDir, { recursive: true });
 mkdirSync(outDir, { recursive: true });
-const rustPath = join(genDir, "app.rs");
-const irPath = join(genDir, "app.ir.json");
+const rustPath = join(outDir, "app.rs");
+const irPath = join(outDir, "app.ir.json");
 await Bun.write(rustPath, rust);
 await Bun.write(irPath, JSON.stringify(program, null, 2) + "\n");
 const pakPath = join(outDir, `${appName}.pak`);

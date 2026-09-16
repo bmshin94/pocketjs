@@ -1,8 +1,13 @@
 // micro/tests/compiler.test.ts — the Micro TS frontend and Rust emitter.
 //
 // The hero demo is the acceptance fixture: its IR shape is pinned here, the
-// committed apps/hero/micro/gen/app.rs must equal a fresh emit (drift
-// guard), and subset violations report file:line:column diagnostics.
+// emitted Rust is asserted at the constructs that carry the compiler's
+// decisions, and subset violations report file:line:column diagnostics.
+//
+// No generated artifact is committed, so nothing here compares against a
+// checked-in file. What proves the emitter end to end is parity.test.ts:
+// it compiles the output with cargo and compares rendered pixels against
+// stock Solid.
 
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
@@ -79,13 +84,52 @@ describe("hero", () => {
     expect(program.assets.strings).toContain("Flexbox, springs and baked type —");
   });
 
-  test("the committed generated module is current", async () => {
+  test("emits caches, masks and gates for exactly the dynamic bindings", () => {
     const styles = compileClasses(program.assets.classes);
     const rust = emitRust(program, { styleIds: styles.ids, fontSlots: styles.usedFontSlots });
-    const committed = await Bun.file(resolve(ROOT, "apps/hero/micro/gen/app.rs")).text();
-    expect(rust).toBe(committed);
-    const ir = await Bun.file(resolve(ROOT, "apps/hero/micro/gen/app.ir.json")).json();
-    expect(ir).toEqual(JSON.parse(JSON.stringify(program)));
+
+    // One signal field, one node table, one flag per conditional block, and a
+    // cache per DYNAMIC binding only.
+    expect(rust).toContain("s0: i32, // count");
+    expect(rust).toContain("n: [NodeId; ELEMENTS],");
+    expect(rust).toContain("show0: bool,");
+    expect(rust).toContain("t29: String,");
+    expect(rust).toContain("p22_translateX: f64,");
+    expect(rust).not.toContain("c0: i32"); // every class binding folded static
+
+    // Writes compare before marking dirty (Solid's === gate).
+    expect(rust).toContain("fn set_s0(&mut self, v: i32) {");
+    expect(rust).toContain("self.dirty |= 0x1u64;");
+
+    // int stays i32 and wraps; it converts once at the f64 host boundary.
+    expect(rust).toContain("self.set_s0(self.s0.wrapping_add(1i32));");
+    expect(rust).toContain("let v: f64 = (self.s0.wrapping_mul(2i32) as f64);");
+    expect(rust).toContain("rt.set_prop(self.n[22], prop::TRANSLATE_X, v);");
+
+    // A text run appends into one scratch String; no intermediate values.
+    expect(rust).toContain('out.push_str("Count: "); fmt::push_int(out, self.s0);');
+
+    // The conditional block carries its own mount/unmount with a static anchor.
+    expect(rust).toContain("fn mount_show0(&mut self, rt: &mut Runtime) {");
+    expect(rust).toContain("rt.create(NodeType::Text as u8, self.n[26], NodeId::NONE)");
+    expect(rust).toContain("fn unmount_show0(&mut self, rt: &mut Runtime) {");
+
+    // Flush dispatches on the dependency mask, in template pre-order.
+    const flush = rust.slice(rust.indexOf("fn flush(&mut self"));
+    expect(flush.slice(0, flush.indexOf("fn state"))).toContain("if d & 0x1u64 != 0 { self.apply_text_29(rt); }");
+    expect(rust.indexOf("self.apply_style_22_translateX(rt); }")).toBeLessThan(rust.indexOf("self.apply_text_29(rt); }"));
+
+    // Static props are written once at mount and have no apply function.
+    expect(rust).toContain('rt.set_image(self.n[3], "logo.png");');
+    expect(rust).toContain('rt.set_sprite(self.n[21], "spinner-atlas.svg", None);');
+    expect(rust).not.toContain("fn apply_class_");
+  });
+
+  test("the emitter is deterministic", () => {
+    const styles = compileClasses(program.assets.classes);
+    const once = emitRust(program, { styleIds: styles.ids, fontSlots: styles.usedFontSlots });
+    const twice = emitRust(compileMicro(HERO), { styleIds: styles.ids, fontSlots: styles.usedFontSlots });
+    expect(twice).toBe(once);
   });
 });
 

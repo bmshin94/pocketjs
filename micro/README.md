@@ -10,7 +10,7 @@ unchanged. Design, subset and results: [DESIGN.md](DESIGN.md).
 ```
 bun micro/compiler/cli.ts check hero          # subset diagnostics + plan
 bun micro/compiler/cli.ts ir hero             # the Micro IR as JSON
-bun micro/compiler/cli.ts build hero          # apps/hero/micro/gen/{app.rs,app.ir.json} + dist/micro/hero/hero.pak
+bun micro/compiler/cli.ts build hero          # dist/micro/hero/{app.rs,app.ir.json,hero.pak,styles.bin,manifest.json}
 bun micro/compiler/cli.ts build hero --psp --release [--tape "0:0,5:64,6:0"]
                                               # + hosts/psp-micro/target/mipsel-sony-psp/release/{pocket-micro-psp.prx,EBOOT.PBP}
 bun micro/tests/parity.ts hero                # byte parity against a fresh Solid oracle (wasm core)
@@ -32,4 +32,9 @@ Layout:
 | `hosts/psp-micro` | the PSP EBOOT (lone cargo-psp crate) |
 | `micro/harness` | desktop harness: generated module + core + software rasterizer, frame dumps for parity |
 | `micro/tests` | compiler tests, the Solid oracle, the parity test |
-| `apps/hero/micro/gen` | committed compiler output for the hero demo (`app.rs`, `app.ir.json`) |
+
+Nothing generated is committed. Every artifact is a pure function of the app
+sources and this compiler, so it is built on demand into ignored `dist/micro/
+<app>/`. What guards the emitter is `micro/tests/parity.test.ts`, which
+compiles its output with cargo and compares rendered pixels against stock
+Solid, plus the emitter assertions in `micro/tests/compiler.test.ts`.
