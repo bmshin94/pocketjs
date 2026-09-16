@@ -15,6 +15,7 @@ const font = openFontArchive({
   path: 'fonts/cjk.pjfa',
   slots: [0, 2, 4], // regular 12, 16, 20 px
   capacity: 384,   // additional resident glyphs per slot
+  blockMs: 3000,   // reserve space while visible missing glyphs load
 });
 // Existing <Text>{filename}</Text> components need no replacement.
 // Release on application disposal:
@@ -63,6 +64,15 @@ metrics. A loaded glyph's advance participates in the same core measurement
 and layout as its pixels. Before loading, an absent glyph uses the strike's
 nominal advance, so proportional text can reflow when metrics arrive.
 
+**`blockMs` hides pending glyph ink while preserving its advance.** The default
+is 0; the accepted range is 0–3000 ms. The interval starts when a missing glyph
+becomes visible and advances with the core clock. Demand collection continues
+while ink is hidden. Loaded and packaged glyphs remain visible. A provider
+reply that confirms no glyph shows the missing-glyph marker without waiting
+for the interval. An unresolved request shows that marker after the interval;
+a later successful reply replaces it. Leaving the visible set releases the
+wait state. This is a bounded loading presentation, not a substitute font.
+
 ## Build and install the archive
 
 ```sh
@@ -100,9 +110,17 @@ characters per grid. Square opens the external UTF-8 document, Circle pauses
 font requests, and Cross reloads the font and document. The local text-read
 capability limits the external document to 1536 bytes.
 
+The cyan marker in the header moves on a 2.4-second loop during loading, pause,
+failure and idle. It runs on the UI thread and animates translation without
+changing layout. It reports frame continuity, not loading progress. The demo
+reserves text space while the archive opens, then uses `blockMs: 3000` for
+visible glyph misses. The `frame` readout is the latest frame interval including
+presentation waits; it is not CPU text-rendering time or a percentile.
+
 Acceptance exercises:
 
-1. Start without a paired companion. Wait for zero pending glyphs.
+1. Start without a paired companion. Watch the cyan marker while characters
+   appear, then wait for zero pending glyphs. The marker must keep moving.
 2. Browse enough pages to exceed 384 resident glyphs in one slot. Return to the
    first page and compare glyph identity and baseline placement.
 3. Cycle all three sizes, including 320 distinct characters on one screen.

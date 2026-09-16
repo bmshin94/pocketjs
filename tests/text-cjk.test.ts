@@ -27,6 +27,9 @@ test("ordinary Text streams unbaked CJK, preserves controls during failure, and 
   });
   const provider = archiveProvider(source);
   provider.fail(true);
+  let host: any;
+  const movingWhileLoading: number[] = [];
+  const movingWhileFailed: number[] = [];
   const world = await bootWorld("text-cjk-main", 60, {
     offload: {
       session: () => 0,
@@ -34,12 +37,25 @@ test("ordinary Text streams unbaked CJK, preserves controls during failure, and 
       take: () => undefined,
       local: provider.ops,
     },
-  });
+  }, (ops) => { host = ops; });
   const step = (mask = 0) => {
     provider.step();
     world.frame(mask);
     world.tick();
-    world.render();
+    const pixels = world.render();
+    // Sample only the cyan marker's header region, excluding text and counters.
+    let total = 0, count = 0;
+    for (let y = 8; y < 28; y++) for (let x = 150; x < 282; x++) {
+      const at = (y * 480 + x) * 4;
+      if (pixels[at] === 103 && pixels[at + 1] === 232 && pixels[at + 2] === 249) {
+        total += x; count++;
+      }
+    }
+    if (count) {
+      const s = JSON.parse(host.fontStreamStats());
+      if (s.pending > 0) movingWhileLoading.push(total / count);
+      if (s.bytes === 0) movingWhileFailed.push(total / count);
+    }
   };
   const advance = (n: number) => {
     for (let i = 0; i < n; i++) step();
@@ -55,6 +71,9 @@ test("ordinary Text streams unbaked CJK, preserves controls during failure, and 
   provider.fail(false);
   press(BTN.CROSS);
   advance(260);
+  expect(movingWhileLoading.length).toBeGreaterThan(20);
+  expect(Math.max(...movingWhileLoading) - Math.min(...movingWhileLoading)).toBeGreaterThan(20);
+  expect(Math.max(...movingWhileFailed) - Math.min(...movingWhileFailed)).toBeGreaterThan(8);
   expect(treeHasText(world.getTree(), "192/1152 cached")).toBe(true);
   expect(treeHasText(world.getTree(), "0 pending")).toBe(true);
   const glyphReads = provider.seen.filter(

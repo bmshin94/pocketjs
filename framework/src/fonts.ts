@@ -16,6 +16,9 @@ export interface FontArchiveOptions {
   slots: number[];
   /** Extra resident glyphs per slot, 1..1024; all slots share a 2 MiB limit. */
   capacity?: number;
+  /** Reserve invisible space for pending glyphs for 0..3000 ms (default 0).
+   * Known missing glyphs use the packaged missing-glyph marker at once. */
+  blockMs?: number;
   onChange?: () => void;
 }
 export interface FontArchiveStatus {
@@ -26,7 +29,12 @@ export interface FontArchiveStatus {
   loaded: number;
   paused: boolean;
 }
-const config = (s: ArchiveStrike, generation: number, capacity: number) => {
+const config = (
+  s: ArchiveStrike,
+  generation: number,
+  capacity: number,
+  blockMs = 0,
+) => {
   const b = new Uint8Array(20),
     v = new DataView(b.buffer);
   v.setUint32(0, F.configMagic, true);
@@ -36,6 +44,7 @@ const config = (s: ArchiveStrike, generation: number, capacity: number) => {
     8,
   );
   v.setUint16(16, capacity, true);
+  v.setUint16(18, blockMs, true);
   return b;
 };
 function decodeHex(s: string): Uint8Array {
@@ -47,8 +56,13 @@ function decodeHex(s: string): Uint8Array {
   )
     throw new Error("Invalid font reply");
   const b = new Uint8Array(s.length / 2);
-  for (let i = 0; i < b.length; i++)
-    b[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
+  // The validated lowercase alphabet needs no per-byte substring or parseInt.
+  // Avoid thousands of temporary strings on the handheld's UI thread.
+  for (let i = 0; i < b.length; i++) {
+    const hi = s.charCodeAt(i * 2), lo = s.charCodeAt(i * 2 + 1);
+    b[i] = ((hi <= 57 ? hi - 48 : hi - 87) << 4) |
+      (lo <= 57 ? lo - 48 : lo - 87);
+  }
   return b;
 }
 /** Framework-neutral scheduler. The host paints ordinary Text and records
@@ -66,11 +80,15 @@ export function createFontArchive(
   )
     throw new Error("Host does not implement text.glyphs.streamed");
   const capacity = options.capacity ?? 384,
+    blockMs = options.blockMs ?? 0,
     slots = [...new Set(options.slots)];
   if (
     !Number.isInteger(capacity) ||
     capacity < 1 ||
     capacity > F.maxResidentEntries ||
+    !Number.isInteger(blockMs) ||
+    blockMs < 0 ||
+    blockMs > 3000 ||
     !slots.length ||
     slots.some((s) => !Number.isInteger(s) || s < 0 || s >= 24)
   )
@@ -150,7 +168,7 @@ export function createFontArchive(
               s.advance,
               s.density,
             ].every((n) => Number.isInteger(n) && n >= 0 && n <= 255) ||
-            !host.fontStreamConfigure!(config(s, value.generation, capacity))
+            !host.fontStreamConfigure!(config(s, value.generation, capacity, blockMs))
           )
             throw new Error(
               `Font slot ${slot} incompatible or exceeds residency budget`,

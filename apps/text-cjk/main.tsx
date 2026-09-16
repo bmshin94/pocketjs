@@ -15,7 +15,8 @@ function TextLab() {
     [status, setStatus] = createSignal("Opening local font archive...");
   const [cache, setCache] = createSignal(""),
     [io, setIo] = createSignal(""),
-    [paused, setPaused] = createSignal(false);
+    [paused, setPaused] = createSignal(false),
+    [fontReady, setFontReady] = createSignal(false);
   let archive: ReturnType<typeof openFontArchive> | undefined,
     frames = 0,
     started = false,
@@ -50,6 +51,8 @@ function TextLab() {
         path: "fonts/cjk.pjfa",
         slots: [0, 2, 4],
         capacity: 384,
+        blockMs: 3000,
+        onChange: () => setFontReady(archive?.status().state === "ready"),
       });
       readDocument();
     }
@@ -74,7 +77,7 @@ function TextLab() {
           if (r.ok) {
             const v = JSON.parse(r.value);
             setIo(
-              `${v.glyphs} reads | ${Math.round(v.bytes / 1024)} KiB I/O | ${v.frameUs ? Math.round(v.frameUs / 1000) : 0} ms/frame`,
+              `${v.glyphs} reads | ${Math.round(v.bytes / 1024)} KiB I/O | frame ${v.frameUs ? Math.round(v.frameUs / 1000) : 0} ms`,
             );
           }
         });
@@ -113,10 +116,17 @@ function TextLab() {
     >
       <View class="flex-row justify-between items-center">
         <Text class="text-base text-white font-bold">Pocket Text Lab</Text>
+        <View class="w-[80] h-[6] rounded-[3px] bg-slate-800" debugName="FrameMotionTrack">
+          <View class="w-[16] h-[6] rounded-[3px] bg-cyan-300 animate-frame-motion" debugName="FrameMotion" />
+        </View>
         <Text class="text-xs text-cyan-300">{`${document() ? "DOCUMENT" : "UNICODE GRID"} ${page() + 1}/82 | ${[12, 16, 20][size()]} px`}</Text>
       </View>
       <Text class="text-xs text-slate-400">{status()}</Text>
-      <View class="h-[172] overflow-hidden flex-col" debugName="DynamicText">
+      <View
+        class="h-[172] overflow-hidden flex-col"
+        debugName="DynamicText"
+        style={{ opacity: fontReady() ? 1 : 0 }}
+      >
         <For each={lines()}>
           {(line) => (
             <Text

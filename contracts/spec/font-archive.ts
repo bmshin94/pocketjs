@@ -16,6 +16,8 @@ export const FONT_ARCHIVE = Object.freeze({
   maxBatch: 4,
   maxGlyphs: 65535,
   maxBytes: 128 * 1024 * 1024,
+  // PFS1 config: u16 capacity at 16, u16 pending-ink block milliseconds at 18
+  // (0..3000; zero preserves immediate missing-glyph markers).
   configMagic: 0x31534650,
   glyphMagic: 0x31474650,
   maxResidentEntries: 1024,

@@ -20,6 +20,11 @@ pub(crate) struct Entry {
     seen: Cell<u64>,
     ink_width: u32,
 }
+struct Waiting {
+    cp: u32,
+    since: u64,
+    seen: u64,
+}
 pub(crate) struct Stream {
     pub generation: u32,
     base: u16,
@@ -28,6 +33,9 @@ pub(crate) struct Stream {
     wanted: RefCell<Vec<u32>>,
     absent: Vec<u32>,
     epoch: Cell<u64>,
+    frame: Cell<u64>,
+    block_ticks: u64,
+    waiting: RefCell<Vec<Waiting>>,
     request_cursor: Cell<usize>,
     width: usize,
     height: usize,
@@ -43,23 +51,42 @@ fn scalar(cp: u32) -> bool {
 }
 
 impl Atlas {
-    pub(crate) fn stream_begin(&self) {
+    pub(crate) fn stream_begin(&self, frame: u64) {
         if let Some(s) = &self.stream {
+            s.waiting.borrow_mut().retain(|w| w.seen >= s.epoch.get());
             s.epoch.set(s.epoch.get().saturating_add(1));
+            s.frame.set(frame);
             s.wanted.borrow_mut().clear();
         }
     }
-    /// Called only after the glyph survives viewport/clip rejection.
-    pub(crate) fn stream_visible(&self, cp: u32, gid: u16) {
-        let Some(s) = &self.stream else { return };
+    /// Records visible demand even while a pending glyph's ink is hidden.
+    /// Returns whether to paint the glyph; layout and advances are unchanged.
+    pub(crate) fn stream_visible(&self, cp: u32, gid: u16) -> bool {
+        let Some(s) = &self.stream else { return true };
         if gid >= s.base && (gid - s.base) < s.entries.len() as u16 {
             s.entries[(gid - s.base) as usize].seen.set(s.epoch.get());
-        } else if gid == 0 && scalar(cp) && !s.absent.contains(&cp) {
+        } else if gid == 0 && scalar(cp) && self.lookup(cp).is_none() && !s.absent.contains(&cp) {
             let mut wanted = s.wanted.borrow_mut();
             if wanted.len() < MAX_VISIBLE_MISSES && !wanted.contains(&cp) {
                 wanted.push(cp);
             }
+            if s.block_ticks > 0 {
+                let mut waiting = s.waiting.borrow_mut();
+                if let Some(w) = waiting.iter_mut().find(|w| w.cp == cp) {
+                    w.seen = s.epoch.get();
+                    return s.frame.get().saturating_sub(w.since) >= s.block_ticks;
+                }
+                if waiting.len() < MAX_VISIBLE_MISSES {
+                    waiting.push(Waiting {
+                        cp,
+                        since: s.frame.get(),
+                        seen: s.epoch.get(),
+                    });
+                    return false;
+                }
+            }
         }
+        true
     }
     fn stream_bytes(&self) -> usize {
         self.stream.as_ref().map_or(0, |s| {
@@ -67,7 +94,7 @@ impl Atlas {
         })
     }
 
-    fn stream_configure(&mut self, b: &[u8]) -> bool {
+    fn stream_configure(&mut self, b: &[u8], tick_rate: u32) -> bool {
         let generation = u32_at(b, 4).unwrap();
         let base = self.stream.as_ref().map_or(self.glyph_count, |s| s.base);
         let base_texture_width = self
@@ -138,6 +165,10 @@ impl Atlas {
             wanted: RefCell::new(Vec::with_capacity(MAX_VISIBLE_MISSES)),
             absent: Vec::with_capacity(capacity),
             epoch: Cell::new(1),
+            frame: Cell::new(0),
+            block_ticks: (u16::from_le_bytes([b[18], b[19]]) as u64 * tick_rate as u64)
+                .div_ceil(1000),
+            waiting: RefCell::new(Vec::new()),
             request_cursor: Cell::new(0),
             width: w,
             height: h,
@@ -251,10 +282,10 @@ impl Atlas {
 }
 
 impl crate::text::Fonts {
-    pub(crate) fn stream_begin(&self) {
+    pub(crate) fn stream_begin(&self, frame: u64) {
         for slot in 0..crate::spec::MAX_FONT_SLOTS {
             if let Some(a) = self.atlas(slot as u8) {
-                a.stream_begin();
+                a.stream_begin(frame);
             }
         }
     }
@@ -266,8 +297,7 @@ impl Ui {
             || u32_at(b, 0) != Some(CONFIG_MAGIC)
             || b[8] as usize >= crate::spec::MAX_FONT_SLOTS
             || b[15] != 0
-            || b[18] != 0
-            || b[19] != 0
+            || u16::from_le_bytes([b[18], b[19]]) > 3000
         {
             return false;
         }
@@ -286,7 +316,12 @@ impl Ui {
         {
             return false;
         }
-        let ok = self.fonts.atlas_mut(slot).unwrap().stream_configure(b);
+        let tick_rate = self.tick_rate();
+        let ok = self
+            .fonts
+            .atlas_mut(slot)
+            .unwrap()
+            .stream_configure(b, tick_rate);
         if ok {
             self.font_revisions[slot as usize] = self.font_revisions[slot as usize].wrapping_add(1);
             self.mark_layout_dirty();

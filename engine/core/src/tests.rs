@@ -4019,7 +4019,11 @@ fn stream_batch(generation: u32, cp: u32, coverage: u8) -> Vec<u8> {
     b
 }
 fn streamed_ui(capacity: u16) -> (Ui, i32) {
+    streamed_ui_at_rate(capacity, 60)
+}
+fn streamed_ui_at_rate(capacity: u16, hz: u32) -> (Ui, i32) {
     let mut ui = Ui::new();
+    assert!(ui.set_tick_rate(hz));
     assert!(ui.load_font_atlas(&encode_atlas(
         2,
         8,
@@ -4027,7 +4031,7 @@ fn streamed_ui(capacity: u16) -> (Ui, i32) {
         7,
         10,
         2,
-        &[(0xfffd, 0, 8), (65, 1, 6)]
+        &[(65, 1, 6), (0xfffd, 0, 8)]
     )));
     assert!(ui.font_stream_configure(&stream_config(1, capacity)));
     let text = ui.create_node(1);
@@ -4128,9 +4132,86 @@ fn streamed_requests_rotate_past_blocked_misses_and_share_slots(){
     let(mut ui,_)=streamed_ui(1);
     assert!(ui.load_font_atlas(&encode_atlas(3,8,8,7,10,2,&[(0xfffd,0,8),(65,1,6)])));
     let mut config=stream_config(1,1);config[8]=3;assert!(ui.font_stream_configure(&config));
-    ui.fonts.stream_begin();
+    ui.fonts.stream_begin(ui.frame);
     for slot in [2,3]{for cp in 0x4e00..0x4e64{ui.fonts.atlas(slot).unwrap().stream_visible(cp,0);}}
     let first=ui.font_stream_requests();let second=ui.font_stream_requests();
     assert!(first.contains("[1,2,19968]"));assert!(first.contains("[1,3,19968]"));
     assert!(!second.contains("19968"));assert!(second.contains("[1,2,19984]"));assert!(second.contains("[1,3,19984]"));
+}
+
+fn streamed_draw_glyphs(ui: &mut Ui) -> Vec<(i32, u16)> {
+    let words = &ui.draw().words;
+    validate_drawlist(words);
+    let mut glyphs = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        match words[i] {
+            spec::draw_op::GLYPH_RUN => {
+                let n = (words[i + 1] >> 16) as usize;
+                for g in 0..n {
+                    glyphs.push((decode_xy(words[i + 3 + g * 2]).0, words[i + 4 + g * 2] as u16));
+                }
+                i += 3 + 2 * n;
+            }
+            spec::draw_op::SCISSOR => i += 3,
+            spec::draw_op::RECT => i += 4,
+            _ => i += 1,
+        }
+    }
+    glyphs
+}
+
+#[test]
+fn streamed_pending_ink_preserves_layout_demand_and_resident_text() {
+    let (mut ui, text) = streamed_ui(4);
+    let mut config = stream_config(2, 4);
+    config[18..20].copy_from_slice(&3000u16.to_le_bytes());
+    assert!(ui.font_stream_configure(&config));
+    ui.set_text(text, "A你A好�");
+    ui.tick();
+    assert_eq!(streamed_draw_glyphs(&mut ui), vec![(0, 1), (14, 1), (28, 0)]);
+    assert_eq!(ui.measure_text("A你A好�", 2), 36.0);
+    assert!(ui.font_stream_requests().contains("20320"));
+    assert!(ui.font_stream_requests().contains("22909"));
+    let mut absent = stream_batch(2, '你' as u32, 0);
+    absent[18] = 0;
+    ui.font_stream_commit(&absent);
+    assert_eq!(streamed_draw_glyphs(&mut ui), vec![(0, 1), (6, 0), (14, 1), (28, 0)]);
+    assert_eq!(ui.font_stream_commit(&stream_batch(2, '好' as u32, 255)), 1);
+    let loaded = streamed_draw_glyphs(&mut ui);
+    assert_eq!(&loaded[..3], &[(0, 1), (6, 0), (14, 1)]);
+    assert_eq!(loaded[3].0, 20);
+    assert_ne!(loaded[3].1, 0);
+    assert_eq!(loaded[4], (28, 0));
+    assert_eq!(ui.measure_text("A你A好�", 2), 36.0);
+}
+
+#[test]
+fn streamed_pending_ink_expires_by_core_time_and_restarts_after_leaving_view() {
+    for hz in [30, 60, 120] {
+        let (mut ui, text) = streamed_ui_at_rate(4, hz);
+        let mut config = stream_config(2, 4);
+        config[18..20].copy_from_slice(&100u16.to_le_bytes());
+        assert!(ui.font_stream_configure(&config));
+        ui.set_text(text, "你");
+        for _ in 0..30 { assert!(streamed_draw_glyphs(&mut ui).is_empty()); }
+        for _ in 1..hz / 10 {
+            ui.tick();
+            assert!(streamed_draw_glyphs(&mut ui).is_empty());
+        }
+        ui.tick();
+        assert_eq!(streamed_draw_glyphs(&mut ui), vec![(0, 0)]);
+        // The block expires without stopping demand or retries.
+        assert!(ui.font_stream_requests().contains("20320"));
+        ui.set_prop(text, spec::prop::TRANSLATE_Y, 500.0);
+        ui.tick(); ui.draw();
+        assert_eq!(ui.font_stream_requests(), "[]");
+        ui.set_prop(text, spec::prop::TRANSLATE_Y, 0.0);
+        ui.tick();
+        assert!(streamed_draw_glyphs(&mut ui).is_empty());
+        assert_eq!(ui.font_stream_commit(&stream_batch(2, '你' as u32, 255)), 1);
+        assert_ne!(streamed_draw_glyphs(&mut ui)[0].1, 0);
+        config[18..20].copy_from_slice(&3001u16.to_le_bytes());
+        assert!(!ui.font_stream_configure(&config));
+    }
 }
