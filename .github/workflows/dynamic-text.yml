@@ -6,13 +6,23 @@ on:
       - '.github/workflows/dynamic-text.yml'
       - 'framework/compiler/**'
       - 'framework/src/pak.ts'
+      - 'framework/src/fonts.ts'
+      - 'framework/src/offload.ts'
+      - 'contracts/spec/font-archive.ts'
+      - 'hosts/psp/src/offload_local.rs'
+      - 'hosts/psp/src/ffi.rs'
+      - 'hosts/web/wasm-ops.js'
+      - 'tests/helpers/font-archive-provider.ts'
+      - 'tools/font-archive.ts'
+      - 'tools/text-lab-assets.ts'
       - 'framework/src/bytes.ts'
       - 'engine/core/**'
       - 'hosts/psp/src/ge.rs'
-      - 'apps/music-cjk/**'
+      - 'apps/text-cjk/**'
       - 'assets/fonts/**'
       - 'tests/font-config.test.ts'
-      - 'tests/music-cjk.test.ts'
+      - 'tests/font-archive.test.ts'
+      - 'tests/text-cjk.test.ts'
       - 'tools/build.ts'
       - 'tools/test.ts'
   workflow_dispatch:
@@ -40,4 +50,4 @@ jobs:
             engine/wasm
       - run: cargo test --locked --manifest-path engine/core/Cargo.toml
       - run: bun tools/wasm.ts
-      - run: bun test tests/font-bake.test.ts tests/font-config.test.ts tests/music-cjk.test.ts
+      - run: bun test tests/font-bake.test.ts tests/font-config.test.ts tests/font-archive.test.ts tests/text-cjk.test.ts

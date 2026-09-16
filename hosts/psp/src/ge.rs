@@ -572,7 +572,7 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                             apply_font_texture(tex, atlas);
                             let bytes = (end - g) * 2 * core::mem::size_of::<VertTC>();
                             let verts = pool_alloc(bytes) as *mut VertTC;
-                            let cw = atlas.coverage_width();
+                            let cw = tex.cell_width;
                             let ch = atlas.coverage_height();
                             for at in g..end {
                                 let (gx, gy) = xy(words[body + at * 2]);
@@ -593,7 +593,7 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                                     u: (sx + cw) as i16,
                                     v: (sy + ch) as i16,
                                     color,
-                                    x: (gx as i32 + atlas.cell_w as i32) as i16,
+                                    x: (gx as i32 + (cw / atlas.raster_density as u32) as i32) as i16,
                                     y: (gy as i32 + atlas.cell_h as i32) as i16,
                                     z: 0,
                                     _pad: 0,

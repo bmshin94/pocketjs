@@ -38,4 +38,5 @@ pub mod veil;
 pub mod vid;
 
 pub mod offload;
+pub mod offload_local;
 pub mod offload_packet;

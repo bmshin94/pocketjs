@@ -64,6 +64,7 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   text: { file: "framework/src/text.ts", aliases: TWINS },
   "text-view": { file: "framework/src/text-view.ts", aliases: TWINS },
   "text/provider": { file: "tools/text-glyph-provider.ts" },
+  fonts: { file: "framework/src/fonts.ts", aliases: TWINS },
   offload: { file: "framework/src/offload.ts", aliases: TWINS },
   "text-layout": { file: "framework/src/text-layout.ts", aliases: TWINS },
   "resource-state": { file: "framework/src/resource-state.ts", aliases: TWINS },

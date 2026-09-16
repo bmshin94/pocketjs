@@ -210,6 +210,7 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // application-surface composition.
   "display.auxiliary",
   "text.glyphs.baked",
+  "text.glyphs.streamed",
   // Codepoints outside the baked charset still render: the host extends
   // the font atlases at runtime (system-font rasterization + loadFontAtlas
   // reload). Required by any app that accepts arbitrary text input.
@@ -269,6 +270,7 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       // globalThis.audio (4-stream mixer on one 44.1 kHz normal channel).
       "audio.pcm",
       "text.glyphs.baked",
+      "text.glyphs.streamed",
     ],
   },
   vita: {

@@ -34,12 +34,11 @@ test("malformed or oversized character policies fail before baking", () => {
   expect(() => readFontConfig(path)).toThrow();
 });
 
-test("all declared demo metadata and >140 Han scalars have real baked glyphs", async () => {
-  const settings = readFontConfig(resolve("apps/music-cjk/fonts.json"));
-  const atlases = await bakeAtlases({ ...settings, slots: [0, 2] });
-  const tracks = await Bun.file("apps/music-cjk/library.json").json() as { title: string; artist: string; filename: string }[];
-  const text = tracks.map(t => `${t.title}${t.artist}${t.filename}`).join("") +
-    Array.from({ length: 256 }, (_, i) => String.fromCodePoint(0x4e00 + i)).join("");
+test("declared ranges and dynamic CJK metadata have real baked glyphs", async () => {
+  const text = "気迫你好世界" + Array.from({length:256},(_,i)=>String.fromCodePoint(0x4e00+i)).join("");
+  const {path}=config({fallback:[resolve("assets/fonts/NotoSansCJK-Demo.otf")],characters:text});
+  const settings=readFontConfig(path);
+  const atlases=await bakeAtlases({...settings,slots:[0,2]});
   for (const atlas of atlases) {
     const dv = new DataView(atlas.bytes.buffer);
     const mapped = new Map<number, number>();

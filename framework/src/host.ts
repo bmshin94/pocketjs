@@ -126,6 +126,11 @@ export interface HostOps {
   loadStyles?(buf: Uint8Array): void;
   /** web/test hosts only — one call per baked font atlas blob. */
   loadFontAtlas?(buf: Uint8Array): void;
+  /** Bounded external glyph cache. These ops perform no filesystem work. */
+  fontStreamConfigure?(descriptor: Uint8Array): boolean;
+  fontStreamRequests?(): string;
+  fontStreamCommit?(glyphs: Uint8Array): number;
+  fontStreamStats?(): string;
   /** JS-side convenience; layout measures natively. → width in px. */
   measureText(str: string, fontSlot: number): number;
   /** Soft-wrap break columns for ONE line under maxW px (spec op 43):

@@ -51,6 +51,8 @@ pub mod stream_rx;
 pub mod style;
 pub mod text;
 pub mod font_pages;
+pub mod font_stream;
+pub mod font_archive;
 pub mod touch;
 pub mod tree;
 pub mod wire;
@@ -1437,6 +1439,7 @@ impl Ui {
     /// Walk the tree into the DrawList (spec.ts DRAWLIST format) and return
     /// it. Output is valid until the next mutating call.
     pub fn draw(&mut self) -> &DrawList {
+        self.fonts.stream_begin();
         if self.layout.needs() {
             layout::relayout(&mut self.tree, &self.styles, &self.fonts, &mut self.layout);
         }

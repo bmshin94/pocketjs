@@ -95,15 +95,15 @@ describe("launcher registry admission", () => {
     // PSP advertises the paired text/offload path; Vita has touch, but does
     // not advertise that transport. A shared DrawList does not imply equal
     // runtime capabilities or make either target a superset of the other.
-    expect(pspOnly.map((app) => app.output)).toEqual(["text-offload-main"]);
+    expect(pspOnly.map((app) => app.output)).toEqual(["text-cjk-main", "text-offload-main"]);
     expect(vitaOnly.map((app) => app.output).sort()).toEqual(["iphone16-demo-main", "nsengine-main"]);
     for (const app of registry.apps.filter((app) => vitaOutputs.has(app.output))) {
       expect(vitaRegistry.apps).toContainEqual(app);
     }
-    expect(pspOutputs.has("music-cjk-main")).toBe(true);
-    expect(vitaOutputs.has("music-cjk-main")).toBe(true);
+    expect(pspOutputs.has("text-cjk-main")).toBe(true);
+    expect(vitaOutputs.has("text-cjk-main")).toBe(false);
     expect(registry.apps).toHaveLength(19);
-    expect(vitaRegistry.apps).toHaveLength(20);
+    expect(vitaRegistry.apps).toHaveLength(19);
   });
 
   test("committed registry.generated.ts is fresh (re-run tools/launcher.ts scan)", async () => {

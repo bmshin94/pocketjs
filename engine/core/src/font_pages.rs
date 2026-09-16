@@ -5,7 +5,8 @@ use crate::text::Atlas;
 use alloc::vec::Vec;
 
 pub const PAGE_DIM: u32 = 128;
-pub const MAX_PAGES: usize = 8;
+pub const PAGE_WIDTH: u32 = 64;
+pub const MAX_PAGES: usize = 16;
 
 pub struct FontPage {
     pub slot: u8,
@@ -13,6 +14,7 @@ pub struct FontPage {
     pub first: u16,
     pub count: u16,
     pub cols: u32,
+    pub cell_width: u32,
     pub width: u32,
     pub height: u32,
     /// Aligned ABGR4444 coverage, white RGB for per-draw modulation.
@@ -57,12 +59,13 @@ impl FontPages {
     /// `None` means the caller must use the source glyph's CPU paint path.
     /// In particular, pressure never overwrites a page queued for GPU reads.
     pub fn get(&mut self, atlas: &Atlas, revision: u64, gid: u16) -> Option<(&FontPage, bool)> {
-        let cw = atlas.coverage_width();
+        let cw = atlas.texture_coverage_width();
+        let source_stride = atlas.coverage_width();
         let ch = atlas.coverage_height();
-        if gid >= atlas.glyph_count || cw == 0 || ch == 0 || cw > PAGE_DIM || ch > PAGE_DIM {
+        if gid >= atlas.glyph_count || cw == 0 || ch == 0 || cw > PAGE_WIDTH || ch > PAGE_DIM {
             return None;
         }
-        let cols = PAGE_DIM / cw;
+        let cols = PAGE_WIDTH / cw;
         let capacity = cols * (PAGE_DIM / ch);
         let first = u32::from(gid) / capacity * capacity;
         self.clock = self.clock.saturating_add(1);
@@ -104,7 +107,8 @@ impl FontPages {
             let y0 = local / cols * ch;
             for y in 0..ch {
                 for x in 0..cw {
-                    let alpha = ((u32::from(src[(y * cw + x) as usize]) + 8) / 17).min(15) as u16;
+                    let alpha = ((u32::from(src[(y * source_stride + x) as usize]) + 8) / 17)
+                        .min(15) as u16;
                     if alpha != 0 {
                         dst[((y0 + y) * width + x0 + x) as usize] = (alpha << 12) | 0x0fff;
                     }
@@ -117,6 +121,7 @@ impl FontPages {
             first: first as u16,
             count: count as u16,
             cols,
+            cell_width: cw,
             width,
             height,
             pixels,
@@ -172,7 +177,7 @@ mod tests {
             assert!(page.contains(gid));
             assert_eq!(pixel(page, gid), (((gid % 15) + 1) << 12) | 0x0fff);
         }
-        assert!(cache.resident_bytes() <= MAX_PAGES * PAGE_DIM as usize * PAGE_DIM as usize * 2);
+        assert!(cache.resident_bytes() <= MAX_PAGES * PAGE_WIDTH as usize * PAGE_DIM as usize * 2);
     }
 
     #[test]
@@ -203,5 +208,28 @@ mod tests {
         let (page, upload) = cache.get(&atlas, 2, 1).unwrap();
         assert!(upload);
         assert_eq!(pixel(page, 1), 0xffff);
+    }
+    #[test]
+    fn transparent_archive_padding_does_not_consume_texture_capacity() {
+        let mut source = atlas(512);
+        let old = core::mem::take(&mut source.bitmap);
+        source.cell_w = 40;
+        source.texture_cell_w = 16;
+        source.bitmap = alloc::vec![0;512*40*16];
+        for gid in 0..512 {
+            for y in 0..16 {
+                source.bitmap[gid * 640 + y * 40..gid * 640 + y * 40 + 16]
+                    .copy_from_slice(&old[gid * 256 + y * 16..gid * 256 + y * 16 + 16]);
+            }
+        }
+        let mut cache = FontPages::default();
+        for gid in 0..320 {
+            let (page, _) = cache
+                .get(&source, 1, gid)
+                .expect("320 narrow glyphs must fit the bounded GPU cache");
+            assert_eq!(page.cell_width, 16);
+            assert_eq!(pixel(page, gid), (((gid % 15) + 1) << 12) | 0xfff);
+        }
+        assert!(cache.resident_bytes() <= 256 * 1024);
     }
 }
