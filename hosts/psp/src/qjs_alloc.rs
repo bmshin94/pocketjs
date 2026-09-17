@@ -1,6 +1,3 @@
-// COPIED VERBATIM from dreamcart runtime/src/qjs_alloc.rs (proven on hardware).
-// See Cargo.toml TODO list before changing anything here.
-
 //! Back QuickJS's allocator with the single-arena sub-allocator (`arena.rs`).
 //!
 //! rust-psp's startup does not set up a C heap, so newlib `malloc` (used by the
@@ -28,14 +25,23 @@ static mut LARGEST_REQUEST: usize = 0;
 static mut LAST_FAILED_REQUEST: usize = 0;
 
 #[derive(Clone, Copy)]
+/// Process-lifetime QuickJS allocation requests, excluding headers, arena
+/// size-class rounding, and Rust/C allocations outside these callbacks.
 pub struct Stats {
+    /// malloc and realloc calls, including zero-size and failed requests.
+    /// Saturates at usize::MAX instead of wrapping on a long-running device.
     pub alloc_calls: usize,
     pub live_requested: usize,
     pub peak_requested: usize,
     pub largest_request: usize,
+    /// Most recent nonzero request that failed; zero means none recorded.
     pub last_failed_request: usize,
 }
 
+/// Read counters without allocating. Creating a new runtime does not reset them.
+///
+/// # Safety
+/// Call on the arena's owning thread, without concurrent allocator access.
 pub unsafe fn stats() -> Stats {
     Stats {
         alloc_calls: ALLOC_CALLS,
@@ -53,7 +59,7 @@ unsafe fn raw_size(ptr: *const c_void) -> usize {
 
 #[inline]
 unsafe fn note_request(size: usize) {
-    ALLOC_CALLS += 1;
+    ALLOC_CALLS = ALLOC_CALLS.saturating_add(1);
     LARGEST_REQUEST = LARGEST_REQUEST.max(size);
 }
 
@@ -121,7 +127,9 @@ unsafe extern "C" fn qjs_malloc(_s: *mut JSMallocState, size: size_t) -> *mut c_
     note_request(size);
     let ptr = raw_alloc(size);
     if ptr.is_null() {
-        LAST_FAILED_REQUEST = size;
+        if size != 0 {
+            LAST_FAILED_REQUEST = size;
+        }
     } else {
         note_live(0, size);
     }
