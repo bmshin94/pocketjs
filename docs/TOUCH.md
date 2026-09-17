@@ -246,3 +246,15 @@ wire            ≤8×u32 电平快照 + 并行事实数组
 3. 自定义滚动物理用 `createScroller`,绑 `translateY: -offset()`
 4. 分支只写在 `hasFeature("input.touch")`,且仅当习语不同
 5. 手感用 journey/tape 断言,和逻辑一样
+
+`createKeyboardTouch` from `@pocketjs/framework/osk` tracks contact-owned space
+and backspace holds without assigning focus to character keys. The keyboard
+view supplies contact geometry and virtual time. **Release clears the hold**;
+backspace repeats at most twice per step, and a held space enters caret dragging.
+The view owns key-cap feedback, character insertion, layout and modality.
+
+## 接触顺序与系统取消
+
+**宿主按 DOWN 顺序交付接触。** 存储槽位和平台指针 ID 不决定回调顺序。Android 和旧版 UIKit 宿主共用有界接触锁存器：普通短按保留一个采样，新接触拥有独立的 guest ID，已采样的结束接触可以腾出容量。
+
+**系统取消不产生 UP 或 tap。** touch word 的 bit 30 标记 CANCEL，其 ID 使用相同的 legacy/wide 解码；坐标不参与取消处理。每帧最多携带八个活动接触和八个取消记录，surface 仍由第 5 参指定。`touches()` 只返回活动接触。手势层先取消旧生命周期，再分配新接触，避免 Space 的取消被解释为提交，并允许满容量的接触在一帧内替换。首次采样前取消的接触不进入 guest。DevTools 保存取消记录以支持重放。

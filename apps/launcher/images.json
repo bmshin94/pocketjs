@@ -104,6 +104,12 @@
   "covers/refl-im-main.png": {
     "linear": true
   },
+  "covers/cover-text-cjk-main.png": {
+    "linear": true
+  },
+  "covers/refl-text-cjk-main.png": {
+    "linear": true
+  },
   "covers/cover-vue-sfc-lab-main.png": {
     "linear": true
   },
@@ -114,6 +120,12 @@
     "linear": true
   },
   "covers/refl-iphone16-demo-main.png": {
+    "linear": true
+  },
+  "covers/cover-text-offload-main.png": {
+    "linear": true
+  },
+  "covers/refl-text-offload-main.png": {
     "linear": true
   },
   "covers/cover-zoomlab-main.png": {

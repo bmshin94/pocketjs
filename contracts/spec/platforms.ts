@@ -50,10 +50,10 @@ export type PackageRole = (typeof PACKAGE_ROLES)[number];
  *   stock host. Admission is the RUNTIME rule this file defines — manifest
  *   `requires` ⊆ target profile `capabilities`.
  * - "aot":   the same source is recompiled natively per device by an AOT
- *   compiler family (Pocket Vapor, Pocket Static). There is no hostAbi, no
+ *   compiler family. There is no hostAbi, no
  *   ops and no runtime capability check; admission is COMPILE-TIME — the
  *   compiler derives the app's demands and checks them against a BOARD
- *   PROFILE (data, not a registry entry — see vapor/BOARDS.md).
+ *   PROFILE (data, not a guest target registry entry).
  *
  * The classes scale differently on purpose: guest targets stay an inventory
  * of real, golden-tested hosts (this registry); aot boards are open-ended
@@ -171,6 +171,9 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // appends the id to its profile only when its native host ships the module
   // (the ring/thread discipline to copy is hosts/psp/src/audio.rs).
   "audio.pcm",
+  // Native encoded-media playback with bounded worker handoff, audio clock,
+  // pause/volume, texture output and observable decoder availability.
+  "media.playback",
   // Bounded whole-response HTTP through `fetch()` and the net module's own
   // namespace (`globalThis.net`, contracts/spec/net.ts). Transport adapters
   // remain host-owned; the browser dev host, deterministic sim and reference
@@ -207,6 +210,7 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // application-surface composition.
   "display.auxiliary",
   "text.glyphs.baked",
+  "text.glyphs.streamed",
   // Codepoints outside the baked charset still render: the host extends
   // the font atlases at runtime (system-font rasterization + loadFontAtlas
   // reload). Required by any app that accepts arbitrary text input.
@@ -220,6 +224,8 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // grants it by installing a core text measurer before the guest mounts
   // (docs/BACKENDS.md).
   "text.layout.native",
+  // Asynchronous worker or paired companion service; availability is session scoped.
+  "text.layout.offload",
 ] as const);
 
 export type PocketCapabilityId = CapabilityId<typeof POCKET_CAPABILITIES>;
@@ -256,11 +262,15 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
     capabilities: [
       "input.analog.left",
       "input.buttons",
+      // USB companion transport only; text never executes on the device.
+      "io.offload",
+      "text.layout.offload",
       "input.cursor",
       // hosts/psp/src/audio_mod.rs: the audio module mounted as
       // globalThis.audio (4-stream mixer on one 44.1 kHz normal channel).
       "audio.pcm",
       "text.glyphs.baked",
+      "text.glyphs.streamed",
     ],
   },
   vita: {
@@ -330,20 +340,8 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "text.glyphs.runtime",
     ],
   },
-  // The gpui app frame (hosts/desktop is the stock host): a resizable ordinary
-  // window on Zed's gpui/Metal, painting the DrawList as vector quads and
-  // host-shaped text instead of rasterized atlas cells (docs/BACKENDS.md).
-  // HostAbi 4 adds the independent compositor-surface op. An app frame, not a
-  // widget shell, so fixed-viewport apps run size-locked
-  // (acceptsFixed) with their baked glyph pipeline intact; apps that enhance
-  // text.layout.native get host text measurement and shaping instead.
-  // The common profile lists ONLY what the host implements for every app:
-  // the keyboard button map and the __pocketResizeViewport live-viewport hook.
-  // Pointer, hardware text, IME and clipboard reach the note through its
-  // companion svc adapter (an app protocol, not a host capability — see
-  // tools/macos.ts), so per the header rule they are not registered here;
-  // a host-generic pointer/text feed needs framework surface beyond the
-  // 9-bit touch packing and is tracked as follow-up work.
+  // Portable desktop host: winit presentation, Rust software rendering and
+  // AppSupervisor on a runtime worker, text in independent offload workers.
   "macos-app": {
     hostAbi: 4,
     platform: "macos",
@@ -359,15 +357,14 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "input.buttons",
       "display.viewport.live",
       "text.glyphs.baked",
-      "text.layout.native",
+      "io.offload",
+      "text.layout.offload",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],
     },
   },
-  // The same gpui AppSupervisor/compositor host on Linux. Linux defaults to
-  // one raster sample per logical pixel while keeping native text layout and
-  // the same dynamic/fixed application admission contract as macOS.
+  // The same portable host on Linux, at one raster sample per logical pixel.
   "linux-app": {
     hostAbi: 4,
     platform: "linux",
@@ -383,7 +380,8 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "input.buttons",
       "display.viewport.live",
       "text.glyphs.baked",
-      "text.layout.native",
+      "io.offload",
+      "text.layout.offload",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],
@@ -408,6 +406,8 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "input.buttons",
       "display.viewport.live",
       "text.glyphs.baked",
+      "io.offload",
+      "text.layout.offload",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],

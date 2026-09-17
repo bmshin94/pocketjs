@@ -44,11 +44,15 @@ pub mod layout;
 pub mod package;
 pub mod pak;
 pub mod raster;
+pub mod compositor;
 pub mod spec;
 pub mod stream;
 pub mod stream_rx;
 pub mod style;
 pub mod text;
+pub mod font_pages;
+pub mod font_stream;
+pub mod font_archive;
 pub mod touch;
 pub mod tree;
 pub mod wire;
@@ -246,6 +250,7 @@ pub struct Ui {
     tree: tree::Tree,
     styles: style::StyleTable,
     fonts: text::Fonts,
+    font_revisions: [u64; spec::MAX_FONT_SLOTS],
     anims: anim::Anims,
     timelines: Vec<TimelineInst>,
     layout: layout::LayoutEngine,
@@ -254,8 +259,8 @@ pub struct Ui {
     textures: Vec<TexSlot>,
     /// LIFO free list of texture slots (freed most recently, reused first).
     tex_free: Vec<u32>,
-    /// Baked rounded-corner disc sprites (see draw::DiscCache).
-    discs: draw::DiscCache,
+    /// Core-owned corner masks and scaled-glyph pages (see draw::PaintCache).
+    paint_cache: draw::PaintCache,
     /// Raster pixels baked for each logical UI pixel. Layout and DrawList
     /// coordinates always remain logical; only core-owned bitmap resources
     /// (currently rounded-corner masks) use this density.
@@ -335,13 +340,14 @@ impl Ui {
             tree: tree::Tree::new(),
             styles: style::StyleTable::new(),
             fonts: text::Fonts::new(),
+            font_revisions: [0; spec::MAX_FONT_SLOTS],
             anims: anim::Anims::new(),
             timelines: Vec::new(),
             layout: layout::LayoutEngine::new(),
             auxiliary: None,
             textures: Vec::new(),
             tex_free: Vec::new(),
-            discs: draw::DiscCache::new(),
+            paint_cache: draw::PaintCache::new(),
             raster_density,
             raster_revision: 1,
             focused: 0,
@@ -796,7 +802,7 @@ impl Ui {
     /// the slot's generation so every outstanding copy of the handle goes
     /// stale (resolves to nothing, draws nothing), and push the slot on the
     /// LIFO free list. Stale/unknown handles are silent no-ops. Freeing a
-    /// core-internal texture (a baked corner disc) is safe: the DiscCache
+    /// core-internal texture (a baked corner disc) is safe: the PaintCache
     /// re-validates its handles each use and re-bakes dead ones.
     pub fn free_texture(&mut self, handle: i32) {
         let Some(slot) = tex_resolve(&self.textures, handle) else {
@@ -965,6 +971,8 @@ impl Ui {
     pub fn load_font_atlas(&mut self, bytes: &[u8]) -> bool {
         let ok = self.fonts.load(bytes);
         if ok {
+            let slot = bytes[12] as usize;
+            self.font_revisions[slot] = self.font_revisions[slot].wrapping_add(1);
             self.mark_layout_dirty();
             self.bump_raster_revision();
         }
@@ -1431,6 +1439,7 @@ impl Ui {
     /// Walk the tree into the DrawList (spec.ts DRAWLIST format) and return
     /// it. Output is valid until the next mutating call.
     pub fn draw(&mut self) -> &DrawList {
+        self.fonts.stream_begin(self.frame);
         if self.layout.needs() {
             layout::relayout(&mut self.tree, &self.styles, &self.fonts, &mut self.layout);
         }
@@ -1465,11 +1474,12 @@ impl Ui {
             &self.tree,
             &self.styles,
             &self.fonts,
+            &self.font_revisions,
             self.frame,
             self.layout.viewport,
             &mut self.textures,
             &mut self.tex_free,
-            &mut self.discs,
+            &mut self.paint_cache,
             self.raster_density,
             &mut self.draw_list,
             self.inspect_id,
@@ -1491,11 +1501,12 @@ impl Ui {
                 &self.tree,
                 &self.styles,
                 &self.fonts,
+                &self.font_revisions,
                 self.frame,
                 self.layout.viewport,
                 &mut self.textures,
                 &mut self.tex_free,
-                &mut self.discs,
+                &mut self.paint_cache,
                 self.raster_density,
                 &mut self.draw_list,
                 self.inspect_id,
@@ -1537,12 +1548,13 @@ impl Ui {
             &self.tree,
             &self.styles,
             &self.fonts,
+            &self.font_revisions,
             self.frame,
             auxiliary.root,
             auxiliary.layout.viewport,
             &mut self.textures,
             &mut self.tex_free,
-            &mut self.discs,
+            &mut self.paint_cache,
             self.raster_density,
             &mut auxiliary.draw_list,
             self.inspect_id,
@@ -1563,12 +1575,13 @@ impl Ui {
                 &self.tree,
                 &self.styles,
                 &self.fonts,
+                &self.font_revisions,
                 self.frame,
                 auxiliary.root,
                 auxiliary.layout.viewport,
                 &mut self.textures,
                 &mut self.tex_free,
-                &mut self.discs,
+                &mut self.paint_cache,
                 self.raster_density,
                 &mut auxiliary.draw_list,
                 self.inspect_id,
@@ -1749,6 +1762,11 @@ impl Ui {
     /// A registered font atlas (backends read glyph bitmaps through this).
     pub fn font_atlas(&self, slot: u8) -> Option<&text::Atlas> {
         self.fonts.atlas(slot)
+    }
+
+    /// Per-slot GPU cache invalidation, including same-count atlas replacements.
+    pub fn font_atlas_revision(&self, slot: u8) -> u64 {
+        self.font_revisions.get(slot as usize).copied().unwrap_or(0)
     }
 
     // ---- internals -----------------------------------------------------------

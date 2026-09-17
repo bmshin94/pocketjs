@@ -207,6 +207,8 @@ export interface SimViewportOptions {
   height?: number;
   rasterDensity?: number;
   renderScale?: number;
+  /** Optional auxiliary surface dimensions, created before the guest mounts. */
+  auxiliary?: [number, number];
 }
 
 /**
@@ -240,6 +242,7 @@ export async function bootWorld(
     ? await Bun.file(DIST + app + ".pak").arrayBuffer()
     : undefined;
   g.frame = undefined;
+  g.offload = undefined; // isolated capability namespace; only test providers grant it
   g.audio = undefined; // audio module namespace: absent unless extraGlobals mounts one
   g.db = undefined; // db module namespace: absent unless extraGlobals mounts one
   g.fs = undefined; // fs module namespace: absent unless extraGlobals mounts one

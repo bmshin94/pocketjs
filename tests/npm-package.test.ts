@@ -79,6 +79,8 @@ describe("published npm artifacts", () => {
       "hosts/blackberry-classic-android",
       "hosts/blackberry-classic-qnx",
       "hosts/web",
+      "hosts/android",
+      "hosts/shared",
       "docs/APPLE.md",
       "docs/IPHONE2G.md",
       "docs/IPHONE4S.md",
@@ -111,6 +113,8 @@ describe("published npm artifacts", () => {
       "engine/crates/pocket-mod/Cargo.toml",
       "engine/crates/pocket-net/src",
       "engine/crates/pocket-net/Cargo.toml",
+      "engine/crates/pocket-sim/src",
+      "engine/crates/pocket-sim/Cargo.toml",
       "engine/crates/pocket-ui-surface/src",
       "engine/crates/pocket-ui-surface/Cargo.toml",
       "engine/crates/pocket-ui-wgpu/src",
@@ -151,6 +155,10 @@ describe("published npm artifacts", () => {
       "engine/pocket3d/crates/pocket3d-gles2/src",
       "engine/pocket3d/crates/pocket3d-gles2/Cargo.toml",
       "engine/pocket3d/crates/pocket3d-gles2/Cargo.lock",
+      "engine/pocket3d/crates/pocket3d-anim/src",
+      "engine/pocket3d/crates/pocket3d-anim/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-mesh/src",
+      "engine/pocket3d/crates/pocket3d-mesh/Cargo.toml",
       "engine/pocket3d/crates/pocket3d/src",
       "engine/pocket3d/crates/pocket3d/Cargo.toml",
       "engine/pocket3d/crates/pocket3d-cook/src",
@@ -169,12 +177,26 @@ describe("published npm artifacts", () => {
       "pocket.config.ts",
       "pocket.json",
       "tsconfig.json",
+      "engine/crates/pocket-text/src",
+      "engine/crates/pocket-text/Cargo.toml",
+      "engine/crates/pocket-text/Cargo.lock",
     ]);
   });
 
   test("framework tarball contains every locked native and standalone Pocket3D input", async () => {
     const files = packedFiles(root);
     expect(files).toEqual(expect.arrayContaining([
+      "engine/pocket3d/crates/pocket3d-anim/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-anim/src/lib.rs",
+      "engine/crates/pocket-sim/src/lib.rs",
+      "tools/companion-session.ts",
+      "engine/pocket3d/crates/pocket3d-mesh/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-mesh/src/lib.rs",
+      "engine/pocket3d/crates/pocket3d-mesh/src/p3m.rs",
+      "engine/pocket3d/crates/pocket3d-mesh/src/colored.rs",
+      "engine/pocket3d/crates/pocket3d-mesh/src/rigid.rs",
+      "tools/3ds-toolchain.ts",
+      "tools/native-source.ts",
       "assets/brand/pocketjs-avatar-white-minimal.png",
       "apps/hero/app.tsx",
       "apps/iphone2g-demo/pocket.json",
@@ -311,6 +333,8 @@ describe("published npm artifacts", () => {
       expect(packages).toContain("pocket-mod");
       expect(packages).toContain("pocket-ui-surface");
       expect(packages).toContain("pocket3d-world");
+      expect(packages).toContain("pocket3d-anim");
+      expect(packages).toContain("pocket3d-mesh");
       expect(existsSync(join(scratch, "package/engine/core/Cargo.toml"))).toBe(true);
     } finally {
       rmSync(scratch, { recursive: true, force: true });
