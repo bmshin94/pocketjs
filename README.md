@@ -206,7 +206,8 @@ against the other.
 
 ### On a desktop
 
-The same markdown editor shelled three ways on an Apple M3 Max
+Historical August 2026 results for the previous gpui host: the same markdown
+editor shelled three ways on an Apple M3 Max
 ([full report](./docs/bench/gpui-vs-tauri-electron-2026-08-18.md), reproduced by
 `bun tools/bench-desktop.ts`):
 
@@ -217,7 +218,7 @@ The same markdown editor shelled three ways on an Apple M3 Max
 | Idle resident memory | **83 MB** | 193 MB | 382 MB |
 | On disk | 10 MB | 9 MB | 242 MB |
 
-With a document open and no input, the pocket build redraws **about twice a
+In that benchmark, with a document open and no input, the pocket build redraws **about twice a
 second**: the caret blinking, and nothing else. The report also records where
 the pocket build loses. Its storm CPU rises with document length, because the
 editor re-wraps the whole document through the QuickJS interpreter on every
@@ -337,23 +338,12 @@ documented in [`hosts/vita/README.md`](./hosts/vita/README.md). Guest builds can
 be packaged as inspectable, target-thinnable
 [`.pocket` files](./docs/PLATFORM.md) instead of per-port directories.
 
-## Ahead-of-time compilation
+## Independent experiment
 
-For machines that cannot host a JavaScript engine at all,
-[Pocket Vapor](./vapor/README.md) compiles a strict Vue Vapor subset ahead of
-time into target-native C: `.gba`, `.gb`, `.nes`, ESP32 firmware, and Playdate
-`.pdx` artifacts, with no JS engine, GC, or allocator on the device. It is a
-separate compiler with its own target and board contracts, not a low-memory mode
-for arbitrary PocketJS applications.
-
-```sh
-bun run vapor:dev             # run the component against the real Vue oracle in a browser
-bun run vapor:test            # oracle + compiler + console parity suites
-bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target gb
-```
-
-Compiler-derived demands are checked against a target or board profile before
-lowering; see [`vapor/DESIGN.md`](./vapor/DESIGN.md).
+[Pocket Vapor](https://github.com/pocket-stack/pocket-vapor) is an early
+TypeScript-to-native compiler experiment in a separate repository. **It is not
+a PocketJS mainline feature.** Its source, examples, toolchains and tests live
+in that repository.
 
 ## Repository layout
 
@@ -364,7 +354,6 @@ lowering; see [`vapor/DESIGN.md`](./vapor/DESIGN.md).
 | [`contracts/`](./contracts/) | Generated wire specs, capability registry, manifests, build plans, and package formats |
 | [`hosts/`](./hosts/) | PSP, Vita, web, desktop, e-reader, phone, and MCU host integrations |
 | [`hosts/esp-idf/`](./hosts/esp-idf/) | Composable package, QuickJS, UI, RGB565, PPA, and runner components for P4/S3 firmware |
-| [`vapor/`](./vapor/) | Pocket Vapor compiler, oracle, board contracts, target runtimes, and parity harnesses |
 | [`apps/`](./apps/) | Framework demos and system applications used by the launcher and acceptance suites |
 | [`tools/`](./tools/) | Build, package, launcher, device, DevTools, benchmark, and release commands |
 | [`tests/`](./tests/) | Contract, compiler, simulation, emulator, package, and golden verification |

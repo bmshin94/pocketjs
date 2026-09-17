@@ -277,6 +277,11 @@ export const OP = {
   hitTestBoundsAuxiliary: 46, // bounds-only twin for auxiliary touch facts.
   //                      Same semantics as hitTestBounds; never searches
   //                      primary. Hosts omit both ops without the capability.
+  // Optional text.glyphs.streamed: bounded CPU handoff, never filesystem I/O.
+  fontStreamConfigure: 47, // (PFS1 bytes) -> bool; attach/detach a slot cache.
+  fontStreamRequests: 48, // () -> JSON of at most 32 [generation,slot,scalar] misses.
+  fontStreamCommit: 49, // (PFG1 bytes) -> accepted count, at most four cells.
+  fontStreamStats: 50, // () -> JSON: residency, visible misses, eviction counters.
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -1524,6 +1529,12 @@ export const BTN = {
 // runtime defaults to ANALOG_CENTER, so every pre-analog host, tape and golden
 // is unchanged. Deadzone/normalization is runtime policy (framework/src/frame.ts), not
 // host policy — hosts pass the raw value through.
+
+// Touch words use bit 30 for a terminal system cancellation. Decode its ID
+// with the word's legacy/wide layout; it is not an active contact. The third
+// frame argument carries at most eight active words plus eight cancellations.
+// Hosts preserve DOWN order; the fifth argument carries surfaces for both.
+// Absence without a cancellation means ordinary UP. See docs/TOUCH.md.
 
 // Optional sixth frame argument carries the right stick with identical packing.
 // Omission reads as center; touch/hit/surface arguments retain their positions.
