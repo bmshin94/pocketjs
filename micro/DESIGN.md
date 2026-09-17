@@ -1,12 +1,16 @@
 # Pocket Micro — design
 
-**Pocket Micro** compiles a PocketJS Solid application to native code. The
-input is the component module the QuickJS host runs today; the output is one
-Rust module that drives `pocketjs-core` through typed calls and links into a
-PSP EBOOT with **no JavaScript engine**. The proof target is `apps/hero`:
-`apps/hero/main.tsx` and `apps/hero/app.tsx` compile unchanged, render
-**byte-identical frames** to stock Solid under the shared core, and run on
-PSP hardware over PSPLINK.
+**Pocket Micro** compiles a statically analyzable TSX UI orchestration
+layer to Rust over `pocketjs-core`. **Small state stays in local signals;
+large state is exposed through bounded Rust-owned windows; unbounded
+collections and history live on the Companion.** Micro TS holds capability
+handles and scalar reads, without an arbitrary heap graph.
+
+The [Field Notes experiment](FEED.md) implements this boundary. It uses
+Tailwind, signal/effect dependencies, typed row access and hardware input.
+Acceptance measures bounded storage, response ordering, reconnect behavior,
+node reuse and native rendering. Complete QuickJS semantic parity is not a
+goal. The earlier Hero comparison below remains evidence for that fixture.
 
 ## 1. Position
 
@@ -18,25 +22,26 @@ Three Pocket compilers now exist, one per boundary:
 | Vue/Solid AOT (#428) | Vue SFC / Solid TSX templates | Rust against `pocket_vapor` over `pocketjs-core` | supplied as a Rust view-model trait implementation |
 | Pocket Micro (`micro/`) | Solid component module in Micro TS | Rust against `pocket-micro` over `pocketjs-core` | compiled: signals, effects, hooks, handlers, refs, animation |
 
-Vapor targets machines with no core at all and owns its cell-grid runtime.
-#428 keeps the retained core and compiles templates, with the model written
-in Rust. Pocket Micro keeps the retained core and compiles the **whole
-module**, so an existing PocketJS app moves from the QuickJS guest to native
-code without a per-app Rust file. The runtime it links (`engine/crates/
-pocket-micro`) is what the Solid runtime did in JS: the two root layers
-`render()` creates, the document-order focus list, CIRCLE press dispatch with
-the `active:` variant, texture and sprite lookup by name, JS number
-formatting.
+Vapor targets machines with no retained core and owns its cell-grid runtime.
+Pocket Micro keeps the retained core. The compiler lowers UI state, bindings
+and calls to typed capabilities; it does not lower arbitrary business data
+structures into a replacement TypeScript runtime. The runtime owns root
+layers, focus, native window storage and frame-boundary delivery.
 
 ## 2. Micro TS
 
-Micro TS is the part of TypeScript + Solid + `@pocketjs/framework` with a
-static shape. Membership has the same operational definition as Pocket
-Vapor's subset: **a Micro TS module runs unmodified under real Solid on a JS
-host**, and the parity test drives both with one tape. The compiler enforces
-the subset with `file:line:column` diagnostics.
+Micro TS is the statically analyzable part of TypeScript + TSX + the
+PocketJS component API. The compiler emits `file:line:column` diagnostics.
+`@pocketjs/framework/micro` declares compile-time native capabilities;
+these declarations do not have a JavaScript runtime implementation.
 
 In:
+
+- `createWindow({method, capacity, fields})` and `<Window each={handle}>`
+  from `@pocketjs/framework/micro`: typed native rows, fixed template slots,
+  dynamic slot indexing and literal field selection. See [FEED.md](FEED.md).
+- Parameterless `onButtonPress(mask, callback)` from
+  `@pocketjs/framework/lifecycle`, with static `BTN` constants from input.
 
 - `createSignal(seed)` for a number, boolean or string seed; `count()`
   reads; `setCount(v)` and `setCount(prev => v)` writes.
@@ -63,8 +68,8 @@ In:
   compound assignment to locals, `if`/`else`, early `return`, setter calls,
   animation calls, inlined helper and callback calls.
 
-Out (diagnostics): dynamic property access and indexing, arrays and
-`<For>`, objects other than `style` and animate options, closures as
+Out (diagnostics): arbitrary object property access and JS array indexing, arrays and
+`<For>`, objects other than capability schemas, `style` and animate options, closures as
 values, `any`, exceptions, async, classes, `createMemo`/`createResource`,
 transitions, setup-level signal reads (`const twice = count() * 2` reads
 once and is not reactive), class strings built from fragments, two

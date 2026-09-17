@@ -20,6 +20,8 @@ pub mod fmt;
 pub mod focus;
 pub mod pak;
 pub mod tape;
+pub mod window;
+pub use serde;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -71,6 +73,9 @@ pub struct Assets {
 
 /// The contract a compiled component implements.
 pub trait App {
+    /// Poll typed capabilities at the frame boundary, before input and flush.
+    fn poll(&mut self, _rt: &mut Runtime) {}
+    fn buttons(&mut self, _rt: &mut Runtime, _pressed: u32, _held: u32) {}
     /// Build the static tree under `rt.app_root()`, apply initial bindings,
     /// register focusables, run effects and mount hooks once.
     fn mount(&mut self, rt: &mut Runtime);
@@ -93,12 +98,14 @@ pub struct Misses {
 /// The mounted runtime: the core plus the state the Solid runtime kept in JS.
 pub struct Runtime {
     pub ui: Ui,
+    pub companion: window::Bridge,
     assets: Assets,
     focus: focus::Focus,
     prev_buttons: u32,
     app_root: NodeId,
     overlay_root: NodeId,
     frame: u64,
+    created_nodes: u64,
     misses: Misses,
 }
 
@@ -134,12 +141,14 @@ impl Runtime {
         ui.insert_before(spec::ROOT_ID, overlay_root, 0);
         Runtime {
             ui,
+            companion: window::Bridge::default(),
             assets,
             focus: focus::Focus::new(),
             prev_buttons: 0,
             app_root: NodeId(app_root),
             overlay_root: NodeId(overlay_root),
             frame: 0,
+            created_nodes: 0,
             misses: Misses::default(),
         }
     }
@@ -165,6 +174,11 @@ impl Runtime {
         self.frame
     }
 
+    /// Total template node allocations since mount, for virtualization receipts.
+    pub fn created_nodes(&self) -> u64 {
+        self.created_nodes
+    }
+
     pub fn focused(&self) -> NodeId {
         self.focus.focused()
     }
@@ -180,9 +194,12 @@ impl Runtime {
     /// CIRCLE press with the `active:` variant held, then the flush loop.
     /// Mirrors framework/src/input.ts `handleFrame` for the classic model.
     pub fn frame<A: App>(&mut self, app: &mut A, buttons: u32) {
+        self.companion.begin_frame();
+        app.poll(self);
         let pressed = buttons & !self.prev_buttons;
         let released = self.prev_buttons & !buttons;
         self.prev_buttons = buttons;
+        app.buttons(self, pressed, buttons);
         if released & spec::btn::CIRCLE != 0 {
             self.set_pressed(NodeId::NONE);
         }
@@ -270,6 +287,7 @@ impl Runtime {
     /// (`NodeId::NONE` appends).
     pub fn create(&mut self, node_type: u8, parent: NodeId, anchor: NodeId) -> NodeId {
         let id = self.ui.create_node(node_type);
+        self.created_nodes += 1;
         self.ui.insert_before(parent.0, id, anchor.0);
         NodeId(id)
     }
@@ -332,5 +350,33 @@ impl Runtime {
 
     pub fn cancel_anim(&mut self, anim: i32) {
         self.ui.cancel_anim(anim);
+    }
+}
+
+/// Frame-paced held-button repeat, independent of host SDK concepts. The
+/// runtime runs at 60 Hz: immediate edge, 200 ms delay, then 15/30/60 rows/s.
+#[derive(Default)]
+pub struct ButtonRepeat {
+    frames: u32,
+}
+impl ButtonRepeat {
+    pub fn tick(&mut self, down: bool) -> bool {
+        if !down {
+            self.frames = 0;
+            return false;
+        }
+        let frame = self.frames;
+        self.frames = self.frames.saturating_add(1);
+        if frame == 0 {
+            return true;
+        }
+        let interval = if frame >= 180 {
+            1
+        } else if frame >= 60 {
+            2
+        } else {
+            4
+        };
+        frame >= 12 && (frame - 12) % interval == 0
     }
 }

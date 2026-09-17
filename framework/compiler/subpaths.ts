@@ -54,6 +54,8 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
     },
     aliases: ALL,
   },
+  // Native compiler declarations; absent from every JS framework walk set.
+  micro: { file: {}, npmFile: "framework/src/micro.ts" },
   animation: { file: "framework/src/animation.ts", aliases: TWINS },
   classic: { file: { solid: "framework/src/classic.ts" } },
   "offload/provider": { file: "tools/offload-provider.ts" },

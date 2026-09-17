@@ -18,7 +18,13 @@ export type BinOp =
 
 export type Builtin = "floor" | "ceil" | "round" | "trunc" | "abs" | "min" | "max";
 
+export interface WindowCapability {
+  id: number; name: string; method: string; capacity: number; cacheCapacity: number; pageSize: number; schema: string;
+  fields: { name: string; ty: "int" | "bool" | "str" }[];
+}
+
 export type Expr =
+  | { k: "window"; id: number; member: string; slot?: Expr; field?: string; ty: Ty }
   | { k: "int"; v: number }
   | { k: "num"; v: number }
   | { k: "bool"; v: boolean }
@@ -42,6 +48,7 @@ export type Expr =
   | { k: "call"; fn: Builtin; args: Expr[]; ty: Ty };
 
 export type Stmt =
+  | { k: "window"; id: number; op: "seek" | "filter" | "retry"; arg?: Expr }
   | { k: "let"; name: string; ty: Ty; init: Expr }
   | { k: "assign"; name: string; e: Expr }
   /** `setCount(e)` */
@@ -126,6 +133,8 @@ export interface Program {
   module: string;
   component: string;
   signals: Signal[];
+  windows: WindowCapability[];
+  buttons: { mask: number; repeat?: boolean; body: Stmt[] }[];
   refs: { name: string; element: number }[];
   effects: { id: number; deps: number[]; body: Stmt[] }[];
   mounts: { id: number; body: Stmt[] }[];
@@ -178,6 +187,7 @@ export function joinTy(a: Ty, b: Ty): Ty | null {
 export function collectDeps(e: Expr, out: Set<number>): void {
   switch (e.k) {
     case "signal": out.add(e.id); return;
+    case "window": out.add(63 - e.id); if (e.slot) collectDeps(e.slot, out); return;
     case "unary": collectDeps(e.e, out); return;
     case "binary": collectDeps(e.l, out); collectDeps(e.r, out); return;
     case "cond": collectDeps(e.c, out); collectDeps(e.t, out); collectDeps(e.f, out); return;
@@ -192,6 +202,7 @@ export function collectDeps(e: Expr, out: Set<number>): void {
 export function collectStmtDeps(stmts: Stmt[], out: Set<number>): void {
   for (const s of stmts) {
     switch (s.k) {
+      case "window": if (s.arg) collectDeps(s.arg, out); break;
       case "let": collectDeps(s.init, out); break;
       case "assign": collectDeps(s.e, out); break;
       case "set": collectDeps(s.e, out); break;

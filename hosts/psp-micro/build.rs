@@ -16,6 +16,7 @@ fn main() {
         "POCKET_MICRO_BUILD",
         "POCKET_MICRO_TAPE",
         "POCKET_MICRO_RECEIPT_FRAME",
+        "POCKET_MICRO_RECEIPT_EVERY",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -49,4 +50,7 @@ fn main() {
         env::var("POCKET_MICRO_TAPE").unwrap_or_default()
     );
     println!("cargo:rustc-env=POCKET_MICRO_RECEIPT_FRAME={receipt}");
+    let every = env::var("POCKET_MICRO_RECEIPT_EVERY").unwrap_or_else(|_| "600".into());
+    assert!(every.parse::<u32>().expect("receipt interval must be an integer") > 0);
+    println!("cargo:rustc-env=POCKET_MICRO_RECEIPT_EVERY={every}");
 }

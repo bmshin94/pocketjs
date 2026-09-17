@@ -46,10 +46,17 @@ static mut BUMP_END: usize = 0;
 static mut INIT_FREE: usize = 0;
 static mut CONFIGURED_SIZE: usize = 0;
 static mut INITED: bool = false;
+static mut LIVE_CLASS_BYTES: usize = 0;
+static mut PEAK_CLASS_BYTES: usize = 0;
+static mut LIVE_BLOCKS: usize = 0;
 
 #[derive(Clone, Copy)]
 pub struct Stats {
     pub capacity_bytes: usize,
+    /// Sum of size-class block sizes currently allocated (excludes free lists).
+    pub live_class_bytes: usize,
+    pub peak_class_bytes: usize,
+    pub live_blocks: usize,
     pub bump_bytes: usize,
     pub tail_free_bytes: usize,
     pub init_free_bytes: usize,
@@ -159,6 +166,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
     let head = FREE[c];
     if !head.is_null() && (head as usize) & (a - 1) == 0 {
         FREE[c] = *(head as *mut *mut u8); // pop: next-pointer is stored in the block
+        account_alloc(c);
         return head;
     }
     // Carve a fresh 2^c block from the bump pointer, aligned to `a` (minimal waste).
@@ -166,6 +174,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
     let np = p + (1usize << c);
     if np <= BUMP_END {
         BUMP = np;
+        account_alloc(c);
         return p as *mut u8;
     }
     // The bump is spent. Before failing, split a larger free block: classes
@@ -192,6 +201,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
             FREE[k] = half;
         }
         if base & (a - 1) == 0 {
+            account_alloc(c);
             return base as *mut u8;
         }
         // Alignment miss (only for align > 16): keep the block in its class
@@ -201,6 +211,13 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
         break;
     }
     ptr::null_mut()
+}
+
+#[inline]
+unsafe fn account_alloc(class: usize) {
+    LIVE_CLASS_BYTES += 1usize << class;
+    LIVE_BLOCKS += 1;
+    PEAK_CLASS_BYTES = PEAK_CLASS_BYTES.max(LIVE_CLASS_BYTES);
 }
 
 /// Free a pointer previously returned by `alloc` with the SAME size + align.
@@ -216,6 +233,8 @@ pub unsafe fn dealloc(p: *mut u8, size: usize, align: usize) {
     }
     *(p as *mut *mut u8) = FREE[c]; // push: store the old head in the freed block
     FREE[c] = p;
+    LIVE_CLASS_BYTES -= 1usize << c;
+    LIVE_BLOCKS -= 1;
 }
 
 pub unsafe fn stats() -> Stats {
@@ -224,6 +243,9 @@ pub unsafe fn stats() -> Stats {
     let bump = BUMP.saturating_sub(BASE);
     Stats {
         capacity_bytes: capacity,
+        live_class_bytes: LIVE_CLASS_BYTES,
+        peak_class_bytes: PEAK_CLASS_BYTES,
+        live_blocks: LIVE_BLOCKS,
         bump_bytes: bump,
         tail_free_bytes: BUMP_END.saturating_sub(BUMP),
         init_free_bytes: INIT_FREE,

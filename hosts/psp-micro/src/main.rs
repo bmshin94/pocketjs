@@ -28,7 +28,7 @@ use psp::sys::{
 
 use pocket_micro::{pak, tape, App as MicroApp, Runtime};
 use pocketjs_core::Ui;
-use pocketjs_psp::{arena, ge, host};
+use pocketjs_psp::{arena, ge, host, offload};
 
 psp::module!("pocket-micro", 1, 1);
 
@@ -109,7 +109,7 @@ unsafe fn write_receipt(rt: &Runtime, app: &App, stats: &Stats, frame: u32) {
         "{{\"app\":\"{}\",\"title\":\"{}\",\"build\":\"{}\",\"engine\":\"native\",\"frame\":{},\"frames_measured\":{},\"tape\":\"{}\",\
          \"boot_to_frame0_us\":{},\"mount_us\":{},\"avg_app_us\":{},\"max_app_us\":{},\"avg_tick_us\":{},\"avg_draw_us\":{},\"avg_render_us\":{},\
          \"state\":{},\"focused\":{},\"unknown_texture\":{},\"unknown_sprite\":{},\
-         \"arena_capacity_bytes\":{},\"arena_bump_bytes\":{},\"arena_tail_free_bytes\":{},\"pak_bytes\":{}}}\n",
+         \"created_nodes\":{},\"glyph_misses\":{},\"arena_live_class_bytes\":{},\"arena_peak_class_bytes\":{},\"arena_live_blocks\":{},\"arena_capacity_bytes\":{},\"arena_bump_bytes\":{},\"arena_tail_free_bytes\":{},\"pak_bytes\":{}}}\n",
         APP_NAME,
         APP_TITLE,
         BUILD_ID,
@@ -127,6 +127,11 @@ unsafe fn write_receipt(rt: &Runtime, app: &App, stats: &Stats, frame: u32) {
         rt.focused().0,
         misses.unknown_texture,
         misses.unknown_sprite,
+        rt.created_nodes(),
+        rt.ui.glyph_misses(),
+        arena.live_class_bytes,
+        arena.peak_class_bytes,
+        arena.live_blocks,
         arena.capacity_bytes,
         arena.bump_bytes,
         arena.tail_free_bytes,
@@ -156,6 +161,12 @@ unsafe fn run() {
         ge::writeback_texture(ui, handle)
     });
     let mut rt = Runtime::new(ui, assets);
+    offload::start();
+    rt.companion = pocket_micro::window::Bridge::new(pocket_micro::window::Transport {
+        session: offload::session,
+        submit: |record| unsafe { offload::submit(record.as_bytes()) },
+        take: || unsafe { offload::take() },
+    });
     let mut app = App::new();
     let mount_begin = now_us();
     rt.mount(&mut app);
@@ -165,6 +176,7 @@ unsafe fn run() {
     };
 
     let receipt_frame: u32 = RECEIPT_FRAME.parse().unwrap_or(240);
+    let receipt_every: u32 = env!("POCKET_MICRO_RECEIPT_EVERY").parse().unwrap_or(600).max(1);
     let mut pad = SceCtrlData::default();
     let mut last_present_vcount = sys::sceDisplayGetVcount();
     let mut frame: u32 = 0;
@@ -175,6 +187,7 @@ unsafe fn run() {
         if let Some(scripted) = tape::mask_at(TAPE, frame) {
             mask = scripted;
         }
+        offload::frame(mask, 0);
         rt.frame(&mut app, mask);
         let t1 = now_us();
         rt.ui.tick();
@@ -201,13 +214,15 @@ unsafe fn run() {
             stats.boot_to_frame0_us = t5.saturating_sub(boot_us);
         }
         let app_us = t1.saturating_sub(t0);
+        offload::stages(app_us as u32, (t3 - t1) as u32, (t5 - t4) as u32);
+        offload::timing((app_us + t3 - t1 + t5 - t4) as u32);
         stats.frames += 1;
         stats.app_sum += app_us;
         stats.app_max = stats.app_max.max(app_us);
         stats.tick_sum += t2.saturating_sub(t1);
         stats.draw_sum += t3.saturating_sub(t2);
         stats.render_sum += t5.saturating_sub(t4);
-        if frame == receipt_frame || (frame > receipt_frame && (frame - receipt_frame) % 600 == 0) {
+        if frame == receipt_frame || (frame > receipt_frame && (frame - receipt_frame) % receipt_every == 0) {
             write_receipt(&rt, &app, &stats, frame);
         }
         frame = frame.wrapping_add(1);

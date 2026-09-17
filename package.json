@@ -151,6 +151,7 @@
   },
   "exports": {
     ".": "./framework/src/index.ts",
+    "./micro": "./framework/src/micro.ts",
     "./animation": "./framework/src/animation.ts",
     "./classic": "./framework/src/classic.ts",
     "./offload/provider": "./tools/offload-provider.ts",
@@ -302,7 +303,9 @@
     "micro:psp": "bun micro/compiler/cli.ts build hero --psp --release",
     "micro:psplink": "bun micro/scripts/psplink.ts hosts/psp-micro/target/mipsel-sony-psp/release/pocket-micro-psp.prx",
     "micro:parity": "bun micro/tests/parity.ts hero",
-    "micro:test": "bun test micro/tests/",
+    "micro:test": "bun test micro/tests/compiler.test.ts micro/tests/window.test.ts micro/tests/psp-layout.test.ts micro/tests/feed.test.ts && cargo test --manifest-path engine/Cargo.toml -p pocket-micro --lib",
+    "micro:feed": "bun micro/compiler/cli.ts build micro-feed --psp --release",
+    "micro:companion": "bun micro/companion/serve.ts",
     "serve": "bun hosts/web/serve.ts",
     "golden": "bun tests/golden.ts",
     "e2e": "bun tests/e2e/ppsspp.ts",

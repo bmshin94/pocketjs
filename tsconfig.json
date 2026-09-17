@@ -17,6 +17,7 @@
     "ignoreDeprecations": "5.0",
     "baseUrl": ".",
     "paths": {
+      "@pocketjs/framework/micro": ["./framework/src/micro.ts"],
       "@pocketjs/framework": ["./framework/src/index.ts"],
       "@pocketjs/framework/animation": ["./framework/src/animation.ts"],
       "@pocketjs/framework/config": ["./framework/src/config.ts"],

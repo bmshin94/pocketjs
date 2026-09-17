@@ -6,9 +6,9 @@
 // lifecycle hooks with block bodies, JSX over the host primitives, class
 // strings that are literals or ternaries of literals, style objects of
 // numeric expressions, and components that inline at their use sites. The
-// subset is enforced here with file:line:column diagnostics; membership has
-// the same operational definition as Pocket Vapor: the same file runs
-// unmodified under real Solid on a JS host.
+// subset is enforced with file:line:column diagnostics. Typed capabilities
+// are compile-time declarations; Micro TS is a UI orchestration layer, not
+// a general TypeScript or Solid runtime.
 //
 // What the frontend does that a JS runtime does at run time:
 //   - resolves every `props.x` read against the use site (root props from
@@ -24,9 +24,10 @@
 //     `cond ? <A/> : null` into conditional blocks with static anchors.
 
 import ts from "typescript";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
-import { abgr, animBit, ENUMS, PROP, PROP_VALUE_KIND, VALUE_KIND, type PropName } from "../../contracts/spec/spec.ts";
+import { BTN, abgr, animBit, ENUMS, PROP, PROP_VALUE_KIND, VALUE_KIND, type PropName } from "../../contracts/spec/spec.ts";
 import {
   binding,
   collectStmtDeps,
@@ -108,6 +109,8 @@ interface Scope {
   refs: Map<string, { element: number | null }>;
   derived: Map<string, FnLike>;
   consts: Map<string, Expr>;
+  windows: Map<string, number>;
+  rows: Map<string, { id: number; slot: number }>;
 }
 
 interface Body {
@@ -165,7 +168,10 @@ export function compileMicro(entryPath: string, options: CompileOptions = {}): P
     throw new MicroCompileError(componentModule.sf, componentModule.sf, "the component module needs one default-exported function");
   }
   let signalTy = new Map<number, Ty>();
-  for (let pass = 0; pass < 4; pass++) {
+  // Each pass can only widen a signal from int to num. The number of
+  // lowered signals bounds propagation, including inlined instances.
+  let passLimit = 2;
+  for (let pass = 0; pass < passLimit; pass++) {
     const ctx = newCtx(entryPath, componentModule.path, mountInfo.title, signalTy);
     const rootScope = emptyScope(entry, "<entry>");
     const props = new Map<string, PropValue>();
@@ -177,6 +183,7 @@ export function compileMicro(entryPath: string, options: CompileOptions = {}): P
     ctx.program.root = nodes;
     ctx.program.component = componentName(component, "App");
     finalize(ctx);
+    passLimit = Math.max(passLimit, ctx.program.signals.length + 2);
     const widened = widenSignals(ctx.program, signalTy);
     if (!widened) return ctx.program;
     signalTy = widened;
@@ -194,6 +201,8 @@ function newCtx(entry: string, module: string, title: string, signalTy: Map<numb
       module: rel(module),
       component: "",
       signals: [],
+      windows: [],
+      buttons: [],
       refs: [],
       effects: [],
       mounts: [],
@@ -225,6 +234,7 @@ function newCtx(entry: string, module: string, title: string, signalTy: Map<numb
 
 function finalize(ctx: Ctx): void {
   const p = ctx.program;
+  if (p.signals.length + p.windows.length > 64) throw new Error("Micro TS: signals and capability revisions share 64 dependency slots");
   p.elements = ctx.nextElement;
   p.shows = ctx.nextShow;
   p.assets.classes = ctx.classes;
@@ -254,6 +264,7 @@ function widenSignals(p: Program, current: Map<number, Ty>): Map<number, Ty> | n
     }
   };
   for (const h of p.handlers) visit(h.body);
+  for (const h of p.buttons) visit(h.body);
   for (const e of p.effects) visit(e.body);
   for (const m of p.mounts) visit(m.body);
   return changed ? next : null;
@@ -274,6 +285,8 @@ function emptyScope(mod: ModuleInfo, name: string): Scope {
     refs: new Map(),
     derived: new Map(),
     consts: new Map(),
+    windows: new Map(),
+    rows: new Map(),
   };
 }
 
@@ -440,6 +453,14 @@ function lowerComponent(fn: FnLike, mod: ModuleInfo, props: Map<string, PropValu
           continue;
         }
         const init = unwrap(decl.initializer);
+        if (ts.isCallExpression(init) && ts.isIdentifier(init.expression)) {
+          const imp = mod.imports.get(init.expression.text);
+          if (imp?.module === `${FRAMEWORK}/micro` && imp.name === "createWindow") {
+            if (isLet) throw new MicroCompileError(mod.sf, decl, "a capability handle is const");
+            registerWindow(local, init, scope, ctx);
+            continue;
+          }
+        }
         if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) {
           scope.derived.set(local, init);
           continue;
@@ -461,6 +482,14 @@ function lowerComponent(fn: FnLike, mod: ModuleInfo, props: Map<string, PropValu
     if (ts.isExpressionStatement(st) && ts.isCallExpression(st.expression) && ts.isIdentifier(st.expression.expression)) {
       const call = st.expression;
       const imp = mod.imports.get((call.expression as ts.Identifier).text);
+      if ((imp && (imp.module === `${FRAMEWORK}/lifecycle` || imp.module === `${FRAMEWORK}/solid/lifecycle`) && imp.name === "onButtonPress") || (imp?.module === `${FRAMEWORK}/micro` && imp.name === "onButtonRepeat")) {
+        if (call.arguments.length !== 2) throw new MicroCompileError(mod.sf, call, "Micro onButtonPress takes a static mask and a parameterless callback");
+        const mask = lowerExpr(call.arguments[0], scope, null, ctx);
+        const callback = unwrap(call.arguments[1]);
+        if (mask.k !== "int" || mask.v <= 0 || mask.v > 65535 || !ts.isArrowFunction(callback) || callback.parameters.length) throw new MicroCompileError(mod.sf, call, "Micro onButtonPress takes a static mask and a parameterless callback");
+        ctx.deferred.push(() => ctx.program.buttons.push({ mask: mask.v, repeat: imp.name === "onButtonRepeat", body: lowerFnBody(callback, scope, newBody(), ctx) }));
+        continue;
+      }
       if (imp && imp.module === "solid-js") {
         const arg = call.arguments[0] ? unwrap(call.arguments[0]) : undefined;
         if (imp.name === "createEffect" || imp.name === "onMount") {
@@ -556,6 +585,25 @@ function lowerJsx(el: JsxLike, scope: Scope, ctx: Ctx): Node[] {
   if (!ts.isIdentifier(opening.tagName)) throw new MicroCompileError(sf, opening, "JSX tags are imported components or host primitives");
   const tagName = opening.tagName.text;
   const imp = scope.mod.imports.get(tagName);
+  if (imp?.module === `${FRAMEWORK}/micro` && imp.name === "Window") {
+    const attrs = opening.attributes.properties;
+    const each = attrs.length === 1 && ts.isJsxAttribute(attrs[0]) && attrs[0].name.getText(sf) === "each" && attrs[0].initializer;
+    const handle = each && ts.isJsxExpression(each) && each.expression;
+    const id = handle && ts.isIdentifier(handle) ? scope.windows.get(handle.text) : undefined;
+    const meaningful = children.filter(c => !(ts.isJsxText(c) && c.containsOnlyTriviaWhiteSpaces));
+    const child = meaningful.length === 1 && ts.isJsxExpression(meaningful[0]) && meaningful[0].expression;
+    if (id === undefined || !child || !ts.isArrowFunction(child) || child.parameters.length < 1 || child.parameters.length > 2 || child.parameters.some(p => !ts.isIdentifier(p.name)) || ts.isBlock(child.body)) {
+      throw new MicroCompileError(sf, opening, "Window takes each={handle} and {(row, slot) => JSX}; the template expands to the declared capacity");
+    }
+    const result: Node[] = [];
+    for (let slot = 0; slot < ctx.program.windows[id].capacity; slot++) {
+      const inner = { ...scope, consts: new Map(scope.consts), rows: new Map(scope.rows) };
+      inner.rows.set((child.parameters[0].name as ts.Identifier).text, { id, slot });
+      if (child.parameters[1]) inner.consts.set((child.parameters[1].name as ts.Identifier).text, { k: "int", v: slot });
+      result.push(...lowerTemplate(child.body, inner, ctx));
+    }
+    return result;
+  }
   if (imp && COMPONENT_MODULES.has(imp.module)) {
     const tag = HOST_TAGS[imp.name];
     if (!tag) throw new MicroCompileError(sf, opening, `${imp.name} has no native lowering in Micro TS (View, Text, Image and Sprite do)`);
@@ -1045,6 +1093,10 @@ function lowerExpr(node: ts.Expression, scope: Scope, body: Body | null, ctx: Ct
     fail(`unknown identifier \`${name}\``);
   }
   if (ts.isPropertyAccessExpression(e)) {
+    if (ts.isIdentifier(e.expression)) {
+      const imp = scope.mod.imports.get(e.expression.text);
+      if (imp?.name === "BTN" && imp.module === `${FRAMEWORK}/input` && Object.hasOwn(BTN, e.name.text)) return { k: "int", v: BTN[e.name.text as keyof typeof BTN] };
+    }
     if (ts.isIdentifier(e.expression) && e.expression.text === scope.propsName) {
       const pv = scope.props.get(e.name.text);
       if (pv === undefined) return { k: "undef" };
@@ -1260,6 +1312,35 @@ function lowerCall(e: ts.CallExpression, scope: Scope, body: Body | null, ctx: C
     fail(`unknown function \`${name}\``);
   }
   if (ts.isPropertyAccessExpression(callee)) {
+    if (ts.isIdentifier(callee.expression)) {
+      const row = scope.rows.get(callee.expression.text);
+      const id = row?.id ?? scope.windows.get(callee.expression.text);
+      if (id !== undefined) {
+        const member = callee.name.text;
+        const cap = ctx.program.windows[id];
+        if (row) {
+          if (e.arguments.length) fail("row accessors take no arguments");
+          if (member === "valid") return { k: "window", id, member, slot: { k: "int", v: row.slot }, ty: "bool" };
+          const field = cap.fields.find(f => f.name === member);
+          if (!field) fail(`unknown window field '${member}'`);
+          return { k: "window", id, member: "row", field: member, slot: { k: "int", v: row.slot }, ty: field!.ty };
+        }
+        if (member === "read" || member === "valid") {
+          if (e.arguments.length !== (member === "read" ? 2 : 1)) fail(`${member} has the wrong number of arguments`);
+          const slot = lowerExpr(e.arguments[0], scope, body, ctx);
+          if (tyOf(slot) !== "int") fail("window slot must be int");
+          if (member === "valid") return { k: "window", id, member, slot, ty: "bool" };
+          const key = lowerExpr(e.arguments[1], scope, body, ctx);
+          const field = key.k === "str" && cap.fields.find(f => f.name === key.v);
+          if (!field) fail("read uses a declared literal field name; slot may be dynamic");
+          return { k: "window", id, member: "row", slot, field: field.name, ty: field.ty };
+        }
+        const ints = ["offset", "query", "len", "capacity", "cacheCapacity", "cached", "inflight", "bytes", "received", "discarded"];
+        const bools = ["loading", "prefetching", "online", "error", "more"];
+        if ((!ints.includes(member) && !bools.includes(member)) || e.arguments.length) fail(`unknown window read '${member}'`);
+        return { k: "window", id, member, ty: ints.includes(member) ? "int" : "bool" };
+      }
+    }
     if (ts.isIdentifier(callee.expression) && callee.expression.text === "Math") {
       const fn = callee.name.text;
       if (!BUILTINS.has(fn)) fail(`Math.${fn} is outside Micro TS`);
@@ -1401,6 +1482,17 @@ function lowerExprStatement(expr: ts.Expression, scope: Scope, body: Body, ctx: 
   }
   if (ts.isCallExpression(e)) {
     const callee = unwrap(e.expression);
+    if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
+      const id = scope.windows.get(callee.expression.text);
+      if (id !== undefined) {
+        const op = callee.name.text;
+        if (op !== "seek" && op !== "filter" && op !== "retry") fail(`unknown window command '${op}'`);
+        if (e.arguments.length !== (op === "retry" ? 0 : 1)) fail(`${op} has the wrong number of arguments`);
+        const arg = e.arguments[0] && lowerExpr(e.arguments[0], scope, body, ctx);
+        if (arg && tyOf(arg) !== "int") fail(`${op} takes an int`);
+        return [{ k: "window", id, op, ...(arg ? { arg } : {}) }];
+      }
+    }
     if (ts.isIdentifier(callee)) {
       const name = callee.text;
       const sig = scope.setters.get(name);
@@ -1552,4 +1644,48 @@ function lowerAnimationCall(fnName: string, e: ts.CallExpression, scope: Scope, 
     }
   }
   return { k: "animate", target: target.element, prop, propId, to: value, durMs, easing, delayMs };
+}
+
+/** Capability configuration is compile-time data, never a JS object at runtime. */
+function registerWindow(name: string, call: ts.CallExpression, scope: Scope, ctx: Ctx): void {
+  const fail: (message: string) => never = (message) => { throw new MicroCompileError(scope.mod.sf, call, message); };
+  const object = (node: ts.Expression | undefined): Map<string, ts.Expression> => {
+    if (!node || !ts.isObjectLiteralExpression(unwrap(node))) return fail("window configuration and fields must be object literals");
+    const map = new Map<string, ts.Expression>();
+    for (const p of (unwrap(node) as ts.ObjectLiteralExpression).properties) {
+      if (!ts.isPropertyAssignment(p) || !(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) || map.has(p.name.text)) return fail("window configuration uses unique named fields");
+      map.set(p.name.text, p.initializer);
+    }
+    return map;
+  };
+  if (call.arguments.length !== 1 || call.typeArguments?.length) fail("createWindow takes one literal schema configuration");
+  const config = object(call.arguments[0]);
+  if (!["method", "capacity", "fields"].every(k => config.has(k)) || [...config.keys()].some(k => !["method", "capacity", "fields", "cacheCapacity", "pageSize"].includes(k))) fail("createWindow requires method, capacity and fields");
+  const method = lowerExpr(config.get("method")!, scope, null, ctx);
+  const capacity = lowerExpr(config.get("capacity")!, scope, null, ctx);
+  if (method.k !== "str" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(method.v)) fail("window method must be a capability identifier literal");
+  if (capacity.k !== "int" || capacity.v < 1 || capacity.v > 8) fail("window capacity must be a literal from 1 to 8");
+  const cache = config.has("cacheCapacity") ? lowerExpr(config.get("cacheCapacity")!, scope, null, ctx) : capacity;
+  const page = config.has("pageSize") ? lowerExpr(config.get("pageSize")!, scope, null, ctx) : capacity;
+  if (cache.k !== "int" || cache.v < capacity.v || cache.v > 1024) fail("cacheCapacity must be a literal between capacity and 1024");
+  if (page.k !== "int" || page.v < 1 || page.v > 8 || cache.v % page.v !== 0) fail("pageSize must be 1..8 and divide cacheCapacity");
+  const fields: import("./ir.ts").WindowCapability["fields"] = [];
+  for (const [key, value] of object(config.get("fields"))) {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,31}$/.test(key) || key === "valid") fail("window field must be an identifier other than valid");
+    const type = lowerExpr(value, scope, null, ctx);
+    if (type.k !== "str" || !["int", "bool", "text"].includes(type.v)) fail("window fields are int, bool or text (at most 96 UTF-8 bytes)");
+    fields.push({ name: key, ty: type.v === "text" ? "str" : type.v as "int" | "bool" });
+  }
+  if (fields.length < 1 || fields.length > 8) fail("window schema has 1 to 8 fields");
+  if (ctx.program.windows.length >= 8) fail("at most 8 typed windows per app");
+  const schema = createHash("sha256").update(JSON.stringify(fields)).digest("hex").slice(0, 16);
+  const id = ctx.program.windows.length;
+  // Conservative 64-bit row layout, including ring tags and the default row.
+  const storage = (f: typeof fields, n: number) => (Math.ceil(f.reduce((v, x) => v + (x.ty === "str" ? 104 : 8), 0) / 8) * 8 + 8) * (n + 1);
+  const cacheBytes = storage(fields, cache.v) + ctx.program.windows.reduce((n, w) => n + storage(w.fields, w.cacheCapacity), 0);
+  if (cacheBytes > 256 * 1024) fail("typed row caches exceed the 256 KiB app budget");
+  ctx.program.windows.push({ id, name, method: method.v, capacity: capacity.v, cacheCapacity: cache.v, pageSize: page.v, fields, schema });
+  scope.windows.set(name, id);
+  // Remote text in this experiment uses the baked ASCII repertoire.
+  for (let cp = 32; cp <= 126; cp++) ctx.strings.add(String.fromCharCode(cp));
 }

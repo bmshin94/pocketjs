@@ -135,6 +135,14 @@ class Emitter {
 
   ex(e: Expr): string {
     switch (e.k) {
+      case "window": {
+        const slot = e.slot ? this.ex(e.slot) : "";
+        if (e.member === "row") {
+          const value = `self.w${e.id}.row(${slot}).f_${e.field}`;
+          return e.ty === "str" ? `String::from(${value}.as_str())` : value;
+        }
+        return `self.w${e.id}.${e.member === "cacheCapacity" ? "cache_capacity" : e.member}(${slot})`;
+      }
       case "int": return rustI32(e.v);
       case "num": return rustF64(e.v);
       case "bool": return e.v ? "true" : "false";
@@ -239,6 +247,10 @@ class Emitter {
 
   stmt(s: Stmt): void {
     switch (s.k) {
+      case "window":
+        this.line(`self.w${s.id}.${s.op}(${s.arg ? this.ex(s.arg) : ""});`);
+        this.line(`if self.w${s.id}.take_dirty() { self.dirty |= ${mask([63 - s.id])}; }`);
+        return;
       case "let":
         this.line(`let mut l_${s.name}: ${rustTy(s.ty)} = ${this.cast(this.ex(s.init), tyOf(s.init), s.ty)};`);
         return;
@@ -333,7 +345,19 @@ class Emitter {
       this.line(`pub const ELEMENTS: usize = ${p.elements};`);
       this.line(`pub const TITLE: &str = ${rustStr(p.title)};`);
       this.line();
+      for (const w of p.windows) {
+        this.line("#[derive(Default, pocket_micro::serde::Deserialize)]");
+        this.line('#[serde(crate = "pocket_micro::serde", deny_unknown_fields)]');
+        this.block(`struct Row${w.id} {`, () => {
+          for (const f of w.fields) {
+            this.line(`#[serde(rename = ${rustStr(f.name)})]`);
+            this.line(`f_${f.name}: ${f.ty === "str" ? "pocket_micro::window::Text<96>" : rustTy(f.ty)},`);
+          }
+        });
+      }
       this.block("pub struct App {", () => {
+        for (const w of p.windows) this.line(`w${w.id}: pocket_micro::window::Window<Row${w.id}, ${w.capacity}, ${w.cacheCapacity}, ${w.pageSize}>,`);
+        p.buttons.forEach((b, i) => { if (b.repeat) this.line(`repeat${i}: pocket_micro::ButtonRepeat,`); });
         for (const s of p.signals) this.line(`s${s.id}: ${rustTy(s.ty)}, // ${s.name}`);
         this.line("n: [NodeId; ELEMENTS],");
         for (const s of shows) this.line(`show${s.id}: bool,`);
@@ -344,8 +368,10 @@ class Emitter {
       });
       this.line();
       this.block("impl App {", () => {
-        this.block("pub const fn new() -> Self {", () => {
+        this.block("pub fn new() -> Self {", () => {
           this.block("App {", () => {
+            for (const w of p.windows) this.line(`w${w.id}: pocket_micro::window::Window::new(${rustStr(w.method)}, ${rustStr(w.schema)}),`);
+            p.buttons.forEach((b, i) => { if (b.repeat) this.line(`repeat${i}: pocket_micro::ButtonRepeat::default(),`); });
             for (const s of p.signals) this.line(`s${s.id}: ${this.constInit(s.init, s.ty)},`);
             this.line("n: [NodeId::NONE; ELEMENTS],");
             for (const s of shows) this.line(`show${s.id}: false,`);
@@ -444,6 +470,15 @@ class Emitter {
       });
       this.line();
       this.block("impl MicroApp for App {", () => {
+        this.block("fn poll(&mut self, rt: &mut Runtime) {", () => {
+          for (const w of p.windows) {
+            this.line(`self.w${w.id}.poll(&mut rt.companion);`);
+            this.line(`if self.w${w.id}.take_dirty() { self.dirty |= ${mask([63 - w.id])}; }`);
+          }
+        });
+        this.block("fn buttons(&mut self, rt: &mut Runtime, pressed: u32, held: u32) {", () => {
+          p.buttons.forEach((b, i) => this.block(b.repeat ? `if self.repeat${i}.tick(held & ${b.mask}u32 != 0) {` : `if pressed & ${b.mask}u32 != 0 {`, () => this.stmts(b.body)));
+        });
         this.block("fn mount(&mut self, rt: &mut Runtime) {", () => {
           this.line("let root = rt.app_root();");
           this.mountNodes(p.root, "root", "NodeId::NONE");
@@ -495,6 +530,10 @@ class Emitter {
             const read: Expr = { k: "signal", id: s.id, ty: s.ty };
             if (s.ty === "str") this.line(`fmt::push_json_str(out, &self.s${s.id});`);
             else this.line(this.pushStr("out", read, true));
+          });
+          p.windows.forEach((w, i) => {
+            this.line(`out.push_str(${rustStr((i || p.signals.length ? "," : "") + JSON.stringify(w.name) + ":")});`);
+            this.line(`self.w${w.id}.state(out);`);
           });
           this.line('out.push_str("}");');
         });
@@ -588,6 +627,7 @@ export function planSummary(program: Program, styleCount: number, fontSlots: num
   const lines = [
     `  component: ${program.component} (${program.module})`,
     `  signals: ${program.signals.length} (${program.signals.map((s) => `${s.name}: ${s.ty}`).join(", ") || "none"})`,
+    `  windows: ${program.windows.map(w => `${w.name}: ${w.capacity} rows / ${w.method} / schema ${w.schema}`).join(", ") || "none"}`,
     `  elements: ${program.elements}, conditional blocks: ${program.shows}, focusables: ${program.focusables.length}`,
     `  bindings: ${dynText} text, ${dynStyle} style, ${dynClass} class; effects: ${program.effects.length}; mounts: ${program.mounts.length}; handlers: ${program.handlers.length}`,
     `  styles: ${program.assets.classes.length} class literals -> ${styleCount} records; fonts: ${fontSlots.map((s) => { const i = fontSlotInfo(s); return `${i.px}px${i.bold ? " bold" : ""}`; }).join(", ")}`,

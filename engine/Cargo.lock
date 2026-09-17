@@ -1772,6 +1772,8 @@ name = "pocket-micro"
 version = "0.1.0"
 dependencies = [
  "pocketjs-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

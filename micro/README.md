@@ -1,11 +1,18 @@
 # Pocket Micro
 
-Pocket Micro compiles a PocketJS Solid application written in **Micro TS** — a
-statically shaped subset of TypeScript, Solid and the `@pocketjs/framework`
-component API — to one Rust module over `pocketjs-core`. The output links
-into a PSP EBOOT that contains **no JavaScript engine**. The proof target is
-`apps/hero`, compiled from `apps/hero/main.tsx` and `apps/hero/app.tsx`
-unchanged. Design, subset and results: [DESIGN.md](DESIGN.md).
+Pocket Micro compiles **Micro TS**, a statically analyzable TSX UI
+orchestration layer, into Rust over `pocketjs-core`. Local signals control
+interaction. **Rust-owned typed capabilities hold bounded windows** into
+Companion-owned collections. The PSP binary contains no JavaScript engine.
+This does not attempt to implement a GC-free TypeScript runtime or reproduce
+all QuickJS/Solid semantics.
+
+The current experiment is [Field Notes](../apps/micro-feed/app.tsx): Tailwind
+classes, local selection/detail signals, reactive filtering, typed window
+reads, a 256-record directional prefetch cache, per-row placeholders and
+accelerated held-button scrolling over a Companion SQLite corpus.
+[Experiment and commands](FEED.md). The original Hero parity fixture remains
+an optional regression check for its supported subset.
 
 ```
 bun micro/compiler/cli.ts check hero          # subset diagnostics + plan
@@ -16,7 +23,7 @@ bun micro/compiler/cli.ts build hero --psp --release [--tape "0:0,5:64,6:0"]
 bun micro/tests/parity.ts hero                # byte parity against a fresh Solid oracle (wasm core)
 bun micro/scripts/psplink.ts <prx> [--port 10000 --host0 <dir>]
                                               # run on a PSP over PSPLINK; collects receipt + screenshot
-bun run micro:test                            # compiler tests + the parity test
+bun run micro:test                            # compiler, typed window, real Companion integration and Rust tests
 ```
 
 Layout:
@@ -35,6 +42,8 @@ Layout:
 
 Nothing generated is committed. Every artifact is a pure function of the app
 sources and this compiler, so it is built on demand into ignored `dist/micro/
-<app>/`. What guards the emitter is `micro/tests/parity.test.ts`, which
-compiles its output with cargo and compares rendered pixels against stock
-Solid, plus the emitter assertions in `micro/tests/compiler.test.ts`.
+<app>/`. `micro/tests/feed.test.ts` compiles its output with cargo, drives the native
+app against the real Companion service, and checks UI state, node reuse and
+live allocations. `micro/tests/window.test.ts` and Rust window tests cover
+schemas, backpressure, stale replies, reconnects and bounded storage.
+`micro:parity` retains the optional Hero pixel comparison.
