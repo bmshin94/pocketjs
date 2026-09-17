@@ -270,3 +270,27 @@ pub unsafe fn stats() -> Stats {
         configured_bytes: CONFIGURED_SIZE,
     }
 }
+
+/// Diagnostic snapshot on the allocator's owning thread; never allocates.
+/// Free lists are separate blocks, so total free is not contiguous space.
+/// Returns `(total_free_bytes, largest_free_block_bytes)`, including the tail.
+/// The largest block is raw storage, not a guaranteed request size after
+/// alignment or size-class rounding. Permanent allocations use only the tail.
+/// Walks every free-list node: O(number of free blocks). Sample on demand or
+/// at a bounded diagnostic interval, outside the per-frame rendering path.
+///
+/// # Safety
+/// Call on the arena's owning thread, without concurrent allocator access.
+pub unsafe fn debug_free() -> (usize, usize) {
+    let mut total = stats().tail_free_bytes;
+    let mut largest = total;
+    for c in MIN_SHIFT..NCLASS {
+        let mut block = FREE[c];
+        if !block.is_null() { largest = largest.max(1usize << c); }
+        while !block.is_null() {
+            total += 1usize << c;
+            block = *(block as *mut *mut u8);
+        }
+    }
+    (total, largest)
+}
