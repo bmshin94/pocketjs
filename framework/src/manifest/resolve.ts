@@ -568,6 +568,10 @@ export function resolveBuildPlan(
       (capability) => !requires.has(capability),
     ),
   );
+  if (requires.has("text.glyphs.streamed") && !requires.has("io.offload") ||
+      enhances.has("text.glyphs.streamed") && !requires.has("io.offload") && !enhances.has("io.offload")) {
+    diagnostics.push({code:"capability.offloadDependency",path:"/engine/capabilities",message:"text.glyphs.streamed requires a matching io.offload declaration"});
+  }
   if (requires.has("text.layout.offload") && !requires.has("io.offload") ||
       enhances.has("text.layout.offload") && !requires.has("io.offload") && !enhances.has("io.offload")) {
     diagnostics.push({code:"capability.offloadDependency",path:"/engine/capabilities",message:"text.layout.offload requires a matching io.offload declaration"});
