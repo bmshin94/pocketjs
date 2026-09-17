@@ -212,6 +212,17 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
 /// class. Exact permanent allocations retain the upstream embedded-map memory
 /// behaviour (one copy, its actual byte length) while still sharing the one
 /// PSP kernel block used by the rest of the runtime.
+///
+/// The result is uninitialized storage. Only alignment padding and `size`
+/// consume the uncarved tail; free-list blocks cannot satisfy this request.
+/// Zero size, invalid alignment, overflow and insufficient tail return null.
+/// A failed request does not advance the bump pointer.
+///
+/// # Safety
+/// Call on the arena's owning thread, without concurrent allocator access.
+/// This allocation lasts until process exit: never pass it to `dealloc`,
+/// `free`, `realloc`, `Box::from_raw` or `Vec::from_raw_parts`. Allocate a
+/// backing store once and reuse it; repeated calls cannot reclaim old stores.
 #[inline]
 pub unsafe fn alloc_permanent(size: usize, align: usize) -> *mut u8 {
     ensure_init();
