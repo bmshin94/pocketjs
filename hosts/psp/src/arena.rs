@@ -203,6 +203,46 @@ pub unsafe fn alloc(size: usize, align: usize) -> *mut u8 {
     ptr::null_mut()
 }
 
+/// Permanently carve an exact-sized block from the arena.
+///
+/// Use this for large, lifetime-long backing stores such as a streamed P3D
+/// map. The normal allocator deliberately rounds every request to a power of
+/// two so freed blocks can be recycled in O(1). That is a severe penalty for
+/// an object which is never freed: an 18.2 MB map would reserve a 32 MB size
+/// class. Exact permanent allocations retain the upstream embedded-map memory
+/// behaviour (one copy, its actual byte length) while still sharing the one
+/// PSP kernel block used by the rest of the runtime.
+///
+/// The result is uninitialized storage. Only alignment padding and `size`
+/// consume the uncarved tail; free-list blocks cannot satisfy this request.
+/// Zero size, invalid alignment, overflow and insufficient tail return null.
+/// A failed request does not advance the bump pointer.
+///
+/// # Safety
+/// Call on the arena's owning thread, without concurrent allocator access.
+/// This allocation lasts until process exit: never pass it to `dealloc`,
+/// `free`, `realloc`, `Box::from_raw` or `Vec::from_raw_parts`. Allocate a
+/// backing store once and reuse it; repeated calls cannot reclaim old stores.
+#[inline]
+pub unsafe fn alloc_permanent(size: usize, align: usize) -> *mut u8 {
+    ensure_init();
+    if size == 0 || BUMP == 0 || !align.is_power_of_two() {
+        return ptr::null_mut();
+    }
+    let a = if align < 16 { 16 } else { align };
+    let Some(p) = BUMP.checked_add(a - 1).map(|p| p & !(a - 1)) else {
+        return ptr::null_mut();
+    };
+    let Some(np) = p.checked_add(size) else {
+        return ptr::null_mut();
+    };
+    if np > BUMP_END {
+        return ptr::null_mut();
+    }
+    BUMP = np;
+    p as *mut u8
+}
+
 /// Free a pointer previously returned by `alloc` with the SAME size + align.
 #[inline]
 pub unsafe fn dealloc(p: *mut u8, size: usize, align: usize) {
