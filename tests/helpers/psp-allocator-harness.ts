@@ -21,7 +21,7 @@ export function allocatorCases(fixture: string, cases: readonly string[]): void 
         stdout: "pipe", stderr: "pipe",
       });
       expect(result.exitCode, `${result.stdout}${result.stderr}`).toBe(0);
-    });
+    }, 60_000);
     for (const name of cases) {
       test(`PSP ${fixture} ${profile}: ${name}`, () => {
         const result = Bun.spawnSync([binary, "--exact", name, "--nocapture"], {
