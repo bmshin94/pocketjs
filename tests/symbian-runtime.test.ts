@@ -465,7 +465,7 @@ describe("experimental Nokia E7 runtime profile", () => {
     expect(runtime).toContain("const QRect target = presentationRect();");
     expect(runtime).toContain("glReadPixels(");
     expect(runtime).toContain(
-      "const QRect sourceRect = presentationRect().intersected(rect());",
+      "const QRect sourceRect = nativeSelf_ > 0 ? rect() : presentationRect().intersected(rect());",
     );
     expect(runtime).toContain("height() - sourceRect.y() - sourceRect.height()");
     expect(runtime).toContain("if (pendingApp_ >= 0 && pendingSummon_)");
@@ -559,7 +559,7 @@ describe("experimental Nokia E7 runtime profile", () => {
 
     expect(project).toContain("QT += core gui opengl");
     expect(project).toContain("equals(POCKETJS_PERF_TRACE, 1): DEFINES += POCKETJS_PERF_TRACE");
-    expect(project).toContain("TARGET.EPOCHEAPSIZE = 0x400000 0x2000000");
+    expect(project).toContain("TARGET.EPOCHEAPSIZE = 0x400000 0x4000000");
     expect(project).toContain(
       "DEPLOYMENT.display_name = $$POCKETJS_SYMBIAN_CAPTION",
     );
