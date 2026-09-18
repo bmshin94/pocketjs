@@ -1,3 +1,24 @@
+# PocketJS (pocket-stack/pocketjs)
+
+## 프로젝트 개요
+스마트폰, 태블릿, PC 어디서든 별도의 복잡한 설치 없이 브라우저 안에서 즉시 앱을 실행하는 "주머니 속 이동식 휴대용 앱 구동기"
+무거운 운영체제에 얽매이지 않고 가볍고 독립적인 나만의 미니 애플리케이션을 어디서나 휴대하며 실행
+데이터와 앱을 내 주머니 속에 쏙 넣고 다니며 자유롭게 활용하고 싶은 디지털 노마드를 위한 신개념 런타임
+
+## 핵심 특징 & 추천 분야
+- 휴대용앱구동기
+- 주머니속런타임
+- 무설정즉시실행
+- 디지털노마드도구
+- 초경량독립플랫폼
+
+---
+*이 문서는 오픈소스 큐레이터(Curator-Agent)에 의해 자동 생성된 가이드 문서입니다.*
+
+
+---
+## 기존 CLAUDE.md 내용
+
 # Repository Instructions
 
 - If the user asks to merge the change, merge it after the relevant checks pass.
